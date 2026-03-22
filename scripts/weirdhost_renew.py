@@ -3,6 +3,7 @@
 # scripts/weirdhost_renew.py
 
 import os
+import sys
 import time
 import asyncio
 import aiohttp
@@ -22,11 +23,26 @@ try:
 except ImportError:
     NACL_AVAILABLE = False
 
+sys.stdout.reconfigure(line_buffering=True)
+
 BASE_URL = "https://hub.weirdhost.xyz/server/"
+API_BASE_URL = "https://hub.weirdhost.xyz/api/client"
 DOMAIN = "hub.weirdhost.xyz"
+MAX_COOKIE_COUNT = 5
 
-RENEW_THRESHOLD_DAYS = int(os.environ.get("RENEW_THRESHOLD_DAYS", "2"))
+RENEWAL_BUTTON_SELECTORS = [
+    "//button//span[contains(text(), '연장하기')]/parent::button",
+    "//button[contains(text(), '연장하기')]",
+    "//button//span[contains(text(), '시간추가')]/parent::button",
+    "//button[contains(text(), '시간추가')]",
+    "//button//span[contains(text(), '시간 추가')]/parent::button",
+    "//button[contains(text(), '시간 추가')]",
+]
 
+
+# ============================================================
+#  工具函数
+# ============================================================
 
 def mask_sensitive(text, show_chars=3):
     if not text:
@@ -56,126 +72,8 @@ def mask_server_id(server_id):
     return server_id[:2] + "*" * (len(server_id) - 4) + server_id[-2:]
 
 
-def mask_url(url):
-    if not url:
-        return "***"
-    if "/server/" in url:
-        parts = url.split("/server/")
-        if len(parts) == 2:
-            return parts[0] + "/server/" + mask_server_id(parts[1])
-    return url
-
-
-def parse_accounts():
-    """解析 ACCOUNTS 环境变量"""
-    accounts_str = os.environ.get("ACCOUNTS", "").strip()
-    
-    if not accounts_str:
-        print("\n" + "=" * 60)
-        print("❌ 错误: WEIRDHOST_ACCOUNTS 环境变量未设置")
-        print("=" * 60)
-        print("\n请在 GitHub Secrets 中设置 WEIRDHOST_ACCOUNTS 变量")
-        print("\n格式示例:")
-        print('''
-[
-  {
-    "remark": "我的账号1",
-    "id": "abc12345-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
-    "cookie_env": "WEIRDHOST_COOKIE_1"
-  },
-  {
-    "remark": "我的账号2",
-    "id": "def67890-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
-    "cookie_env": "WEIRDHOST_COOKIE_2"
-  }
-]
-''')
-        print("字段说明:")
-        print("  - remark    : 账号备注名称 (用于识别)")
-        print("  - id        : 服务器ID (从URL https://hub.weirdhost.xyz/server/xxxxx 获取)")
-        print("  - cookie_env: Cookie对应的环境变量名 (需要同时在Secrets中设置)")
-        print("\n同时需要设置对应的 Cookie 变量:")
-        print("  - WEIRDHOST_COOKIE_1: remember_web_xxxxxx=xxxxxx")
-        print("  - WEIRDHOST_COOKIE_2: remember_web_xxxxxx=xxxxxx")
-        print("\n" + "=" * 60)
-        return []
-    
-    try:
-        accounts = json.loads(accounts_str)
-        if not isinstance(accounts, list):
-            print("\n" + "=" * 60)
-            print("❌ 错误: ACCOUNTS 格式错误")
-            print("=" * 60)
-            print("\nACCOUNTS 应为 JSON 数组格式，当前解析结果不是数组")
-            print(f"当前类型: {type(accounts).__name__}")
-            print("\n正确格式示例: [{...}, {...}]")
-            print("=" * 60)
-            return []
-        
-        if len(accounts) == 0:
-            print("\n" + "=" * 60)
-            print("❌ 错误: ACCOUNTS 数组为空")
-            print("=" * 60)
-            print("\n请添加至少一个账号配置")
-            print("=" * 60)
-            return []
-        
-        # 验证每个账号的必要字段
-        valid_accounts = []
-        for i, acc in enumerate(accounts):
-            if not isinstance(acc, dict):
-                print(f"[!] 账号 {i+1} 格式错误: 应为对象")
-                continue
-            
-            missing = []
-            if not acc.get("id"):
-                missing.append("id")
-            if not acc.get("cookie_env"):
-                missing.append("cookie_env")
-            
-            if missing:
-                print(f"[!] 账号 {i+1} 缺少必要字段: {', '.join(missing)}")
-                continue
-            
-            valid_accounts.append(acc)
-        
-        if not valid_accounts:
-            print("[!] 没有有效的账号配置")
-            return []
-        
-        print(f"[+] 解析到 {len(valid_accounts)} 个有效账号配置")
-        return valid_accounts
-        
-    except json.JSONDecodeError as e:
-        print("\n" + "=" * 60)
-        print("❌ 错误: ACCOUNTS JSON 解析失败")
-        print("=" * 60)
-        print(f"\n错误信息: {e}")
-        print(f"\n原始内容前100字符: {accounts_str[:100]}...")
-        print("\n请检查 JSON 格式是否正确:")
-        print("  - 使用双引号而非单引号")
-        print("  - 确保括号匹配")
-        print("  - 检查逗号使用")
-        print("=" * 60)
-        return []
-
-
-def parse_weirdhost_cookie(cookie_str):
-    if not cookie_str:
-        return (None, None)
-    cookie_str = cookie_str.strip()
-    if "=" in cookie_str:
-        parts = cookie_str.split("=", 1)
-        if len(parts) == 2:
-            return (parts[0].strip(), unquote(parts[1].strip()))
-    return (None, None)
-
-
-def build_server_url(server_id):
-    if not server_id:
-        return None
-    server_id = server_id.strip()
-    return server_id if server_id.startswith("http") else f"{BASE_URL}{server_id}"
+def random_delay(min_sec=0.5, max_sec=2.0):
+    time.sleep(random.uniform(min_sec, max_sec))
 
 
 def calculate_remaining_time(expiry_str):
@@ -185,7 +83,7 @@ def calculate_remaining_time(expiry_str):
                 expiry_dt = datetime.strptime(expiry_str.strip(), fmt)
                 diff = expiry_dt - datetime.now()
                 if diff.total_seconds() < 0:
-                    return "⚠️ 已过期"
+                    return "已过期"
                 days = diff.days
                 hours = diff.seconds // 3600
                 minutes = (diff.seconds % 3600) // 60
@@ -223,22 +121,108 @@ def get_remaining_days(expiry_str):
     return diff.total_seconds() / 86400
 
 
-def should_renew(expiry_str):
-    remaining_days = get_remaining_days(expiry_str)
-    if remaining_days is None:
-        return True
-    return remaining_days <= RENEW_THRESHOLD_DAYS
+def format_remaining_days(rd):
+    if rd is None:
+        return "?"
+    return f"{rd:.1f}"
 
 
-def random_delay(min_sec=0.5, max_sec=2.0):
-    time.sleep(random.uniform(min_sec, max_sec))
+def parse_weirdhost_cookie(cookie_str):
+    if not cookie_str:
+        return (None, None)
+    cookie_str = cookie_str.strip()
+    if "=" in cookie_str:
+        parts = cookie_str.split("=", 1)
+        if len(parts) == 2:
+            return (parts[0].strip(), unquote(parts[1].strip()))
+    return (None, None)
 
+
+def build_server_url(server_id):
+    if not server_id:
+        return None
+    server_id = server_id.strip()
+    return server_id if server_id.startswith("http") else f"{BASE_URL}{server_id}"
+
+
+# ============================================================
+#  账号自动检测
+# ============================================================
+
+def parse_account_config(raw_value):
+    """
+    解析环境变量值
+    格式: 备注-----remember_web_xxx=yyy
+    兼容: remember_web_xxx=yyy (无备注)
+    """
+    if not raw_value:
+        return None
+    raw_value = raw_value.strip()
+
+    remark = ""
+    cookie_str = ""
+
+    if "-----" in raw_value:
+        parts = raw_value.split("-----", 1)
+        remark = parts[0].strip()
+        cookie_str = parts[1].strip() if len(parts) > 1 else ""
+    else:
+        cookie_str = raw_value
+
+    if not cookie_str or "=" not in cookie_str:
+        return None
+
+    cookie_name, cookie_value = parse_weirdhost_cookie(cookie_str)
+    if not cookie_name or not cookie_name.startswith("remember_web"):
+        return None
+
+    return {
+        "remark": remark,
+        "cookie_str": cookie_str,
+        "cookie_name": cookie_name,
+        "cookie_value": cookie_value,
+    }
+
+
+def detect_accounts():
+    """自动扫描 WEIRDHOST_COOKIE_1 ~ WEIRDHOST_COOKIE_N"""
+    accounts = []
+    for i in range(1, MAX_COOKIE_COUNT + 1):
+        env_name = f"WEIRDHOST_COOKIE_{i}"
+        raw = os.environ.get(env_name, "").strip()
+        if not raw:
+            continue
+
+        config = parse_account_config(raw)
+        if not config:
+            print(f"[WARN] {env_name} 格式错误，跳过")
+            print(f"       正确格式: 备注-----remember_web_xxx=yyy")
+            continue
+
+        remark = config["remark"] or f"账号{i}"
+        print(f"[INFO] 检测到 {env_name}: {remark}")
+
+        accounts.append({
+            "index": i,
+            "cookie_env": env_name,
+            "remark": remark,
+            "cookie_str": config["cookie_str"],
+            "cookie_name": config["cookie_name"],
+            "cookie_value": config["cookie_value"],
+        })
+
+    return accounts
+
+
+# ============================================================
+#  Telegram 通知
+# ============================================================
 
 async def tg_notify(message):
     token = os.environ.get("TG_BOT_TOKEN")
     chat_id = os.environ.get("TG_CHAT_ID")
     if not token or not chat_id:
-        print("[TG] 未配置 TG_BOT_TOKEN 或 TG_CHAT_ID，跳过通知")
+        print("[INFO] 未配置 TG_BOT_TOKEN 或 TG_CHAT_ID，跳过通知")
         return
     async with aiohttp.ClientSession() as session:
         try:
@@ -247,7 +231,7 @@ async def tg_notify(message):
                 json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
             )
         except Exception as e:
-            print(f"[TG] 发送失败: {e}")
+            print(f"[ERROR] TG 发送失败: {e}")
 
 
 async def tg_notify_photo(photo_path, caption=""):
@@ -265,7 +249,7 @@ async def tg_notify_photo(photo_path, caption=""):
                 data.add_field("parse_mode", "HTML")
                 await session.post(f"https://api.telegram.org/bot{token}/sendPhoto", data=data)
         except Exception as e:
-            print(f"[TG] 图片发送失败: {e}")
+            print(f"[ERROR] TG 图片发送失败: {e}")
 
 
 def sync_tg_notify(message):
@@ -275,6 +259,10 @@ def sync_tg_notify(message):
 def sync_tg_notify_photo(photo_path, caption=""):
     asyncio.run(tg_notify_photo(photo_path, caption))
 
+
+# ============================================================
+#  GitHub Secret
+# ============================================================
 
 def encrypt_secret(public_key, secret_value):
     pk = public.PublicKey(public_key.encode("utf-8"), encoding.Base64Encoder())
@@ -310,6 +298,174 @@ async def update_github_secret(secret_name, secret_value):
             return False
 
 
+# ============================================================
+#  WeirdHost API
+# ============================================================
+
+class WeirdHostAPI:
+    def __init__(self, cookie_str):
+        self.cookie_name, self.cookie_value = parse_weirdhost_cookie(cookie_str)
+        self.xsrf_token = None
+        self.initialized = False
+
+    async def init_session(self, session):
+        if self.initialized:
+            return True
+        if not self.cookie_name or not self.cookie_value:
+            return False
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "text/html,application/xhtml+xml",
+        }
+        session.cookie_jar.update_cookies({self.cookie_name: self.cookie_value})
+        try:
+            async with session.get(f"https://{DOMAIN}/", headers=headers) as resp:
+                if resp.status != 200:
+                    return False
+                for c in session.cookie_jar:
+                    if c.key == "XSRF-TOKEN":
+                        self.xsrf_token = unquote(c.value)
+                self.initialized = True
+                return True
+        except Exception as e:
+            print(f"[ERROR] API 初始化异常: {e}")
+            return False
+
+    async def api_request(self, session, endpoint):
+        if not self.initialized and not await self.init_session(session):
+            return None
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": f"https://{DOMAIN}/",
+        }
+        if self.xsrf_token:
+            headers["X-XSRF-TOKEN"] = self.xsrf_token
+        try:
+            async with session.get(f"{API_BASE_URL}{endpoint}", headers=headers) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                elif resp.status == 401:
+                    return {"error": "unauthorized"}
+                return None
+        except Exception as e:
+            print(f"[ERROR] API 请求异常: {e}")
+            return None
+
+    async def get_account_email(self, session):
+        data = await self.api_request(session, "/account/activity?sort=-timestamp&page=1&include[]=actor")
+        if not data or data.get("error"):
+            return None
+        for item in data.get("data", []):
+            actor = item.get("attributes", {}).get("relationships", {}).get("actor", {})
+            if actor.get("object") == "user":
+                email = actor.get("attributes", {}).get("email")
+                if email:
+                    return email
+        return None
+
+    async def get_server_list(self, session):
+        return await self.api_request(session, "?page=1")
+
+    async def get_server_info(self, session, server_uuid, server_type="notfree"):
+        ep = f"/freeservers/{server_uuid}/info" if server_type == "free" else f"/notfreeservers/{server_uuid}/info"
+        return await self.api_request(session, ep)
+
+
+async def check_cookie_valid_async(cookie_str):
+    cn, cv = parse_weirdhost_cookie(cookie_str)
+    if not cn or not cv:
+        return False
+    connector = aiohttp.TCPConnector(ssl=False)
+    try:
+        async with aiohttp.ClientSession(connector=connector) as session:
+            session.cookie_jar.update_cookies({cn: cv})
+            headers = {"User-Agent": "Mozilla/5.0", "Accept": "text/html"}
+            async with session.get(f"https://{DOMAIN}/", headers=headers) as resp:
+                if resp.status != 200:
+                    return False
+            api_headers = {
+                "Accept": "application/json",
+                "User-Agent": "Mozilla/5.0",
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": f"https://{DOMAIN}/",
+            }
+            for c in session.cookie_jar:
+                if c.key == "XSRF-TOKEN":
+                    api_headers["X-XSRF-TOKEN"] = unquote(c.value)
+            async with session.get(f"{API_BASE_URL}?page=1", headers=api_headers) as resp:
+                if resp.status == 200:
+                    return "data" in (await resp.json())
+                return False
+    except:
+        return False
+
+
+def check_cookie_valid(cookie_str):
+    return asyncio.run(check_cookie_valid_async(cookie_str))
+
+
+async def get_account_info_via_api_async(cookie_str):
+    api = WeirdHostAPI(cookie_str)
+    connector = aiohttp.TCPConnector(ssl=False)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        if not await api.init_session(session):
+            return None
+
+        email = await api.get_account_email(session)
+
+        server_list = await api.get_server_list(session)
+        if not server_list or server_list.get("error"):
+            return {"email": email, "servers": []}
+
+        servers = []
+        for s in server_list.get("data", []):
+            attrs = s.get("attributes", {})
+            stype = attrs.get("server_type", "")
+            info = {
+                "identifier": attrs.get("identifier", ""),
+                "uuid": attrs.get("uuid", ""),
+                "name": attrs.get("name", ""),
+                "server_type": stype,
+                "expire": "Unknown",
+                "add_hours": "Unknown",
+            }
+            if attrs.get("uuid") and stype in ("notfree", "free"):
+                si = await api.get_server_info(session, attrs["uuid"], stype)
+                if si and si.get("success"):
+                    d = si.get("data", {})
+                    info["expire"] = d.get("expire", "Unknown")
+                    info["add_hours"] = d.get("addHours", "Unknown")
+            servers.append(info)
+
+        return {"email": email, "servers": servers}
+
+
+def get_account_info_via_api(cookie_str):
+    return asyncio.run(get_account_info_via_api_async(cookie_str))
+
+
+async def get_server_info_via_api_async(cookie_str, server_uuid, server_type="notfree"):
+    api = WeirdHostAPI(cookie_str)
+    connector = aiohttp.TCPConnector(ssl=False)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        if not await api.init_session(session):
+            return None
+        info = await api.get_server_info(session, server_uuid, server_type)
+        if info and info.get("success"):
+            return info.get("data", {})
+        return None
+
+
+def get_server_info_via_api(cookie_str, server_uuid, server_type="notfree"):
+    return asyncio.run(get_server_info_via_api_async(cookie_str, server_uuid, server_type))
+
+
+# ============================================================
+#  SeleniumBase 页面交互
+# ============================================================
+
 def get_expiry_from_page(sb):
     try:
         page_text = sb.get_page_source()
@@ -324,6 +480,39 @@ def get_expiry_from_page(sb):
         return "Unknown"
 
 
+def find_renewal_button(sb):
+    for selector in RENEWAL_BUTTON_SELECTORS:
+        try:
+            if sb.is_element_present(selector):
+                return selector
+        except:
+            continue
+    return None
+
+
+def check_renewal_button_enabled(sb):
+    xpath = find_renewal_button(sb)
+    if not xpath:
+        return (False, False, None, "页面上未找到续期按钮")
+
+    try:
+        is_disabled = sb.execute_script(f"""
+            var btn = document.evaluate("{xpath}", document, null,
+                XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+            if (!btn) return null;
+            return btn.disabled || btn.getAttribute('aria-disabled') === 'true'
+                   || btn.classList.contains('disabled');
+        """)
+        if is_disabled is None:
+            return (False, False, None, "按钮元素无法访问")
+        if is_disabled:
+            return (True, False, xpath, "续期按钮已禁用（可能在冷却期）")
+    except:
+        pass
+
+    return (True, True, xpath, "")
+
+
 def is_logged_in(sb):
     try:
         url = sb.get_current_url()
@@ -331,18 +520,11 @@ def is_logged_in(sb):
             return False
         if get_expiry_from_page(sb) != "Unknown":
             return True
-        # 更新按钮检测 - 支持新旧按钮文本
-        renewal_buttons = [
-            "//button//span[contains(text(), '연장하기')]",
-            "//button[contains(text(), '연장하기')]", 
-            "//button//span[contains(text(), '시간추가')]",
-            "//button[contains(text(), '시간추가')]",
-            "//button//span[contains(text(), '시간 추가')]",
-            "//button[contains(text(), '시간 추가')]"
-        ]
-        for btn_xpath in renewal_buttons:
-            if sb.is_element_present(btn_xpath):
-                return True
+        if find_renewal_button(sb):
+            return True
+        if sb.is_element_present("//div[contains(@class,'ServerControls')]") or \
+           sb.is_element_present("//a[contains(@href,'/server/')]"):
+            return True
         return False
     except:
         return False
@@ -352,7 +534,6 @@ EXPAND_POPUP_JS = """
 (function() {
     var turnstileInput = document.querySelector('input[name="cf-turnstile-response"]');
     if (!turnstileInput) return 'no turnstile input';
-
     var el = turnstileInput;
     for (var i = 0; i < 20; i++) {
         el = el.parentElement;
@@ -363,7 +544,6 @@ EXPAND_POPUP_JS = """
         }
         el.style.minWidth = 'max-content';
     }
-
     var turnstileContainers = document.querySelectorAll('[class*="sc-fKFyDc"], [class*="nwOmR"]');
     turnstileContainers.forEach(function(container) {
         container.style.overflow = 'visible';
@@ -371,7 +551,6 @@ EXPAND_POPUP_JS = """
         container.style.minWidth = '300px';
         container.style.height = '65px';
     });
-
     var iframes = document.querySelectorAll('iframe');
     iframes.forEach(function(iframe) {
         if (iframe.src && iframe.src.includes('challenges.cloudflare.com')) {
@@ -382,7 +561,6 @@ EXPAND_POPUP_JS = """
             iframe.style.opacity = '1';
         }
     });
-
     return 'done';
 })();
 """
@@ -390,9 +568,9 @@ EXPAND_POPUP_JS = """
 
 def check_turnstile_exists(sb):
     try:
-        return sb.execute_script("""
-            return document.querySelector('input[name="cf-turnstile-response"]') !== null;
-        """)
+        return sb.execute_script(
+            "return document.querySelector('input[name=\"cf-turnstile-response\"]') !== null;"
+        )
     except:
         return False
 
@@ -409,21 +587,15 @@ def check_turnstile_solved(sb):
 
 def get_turnstile_checkbox_coords(sb):
     try:
-        coords = sb.execute_script("""
+        return sb.execute_script("""
             var iframes = document.querySelectorAll('iframe');
             for (var i = 0; i < iframes.length; i++) {
                 var src = iframes[i].src || '';
                 if (src.includes('cloudflare') || src.includes('turnstile')) {
                     var rect = iframes[i].getBoundingClientRect();
                     if (rect.width > 0 && rect.height > 0) {
-                        return {
-                            x: rect.x,
-                            y: rect.y,
-                            width: rect.width,
-                            height: rect.height,
-                            click_x: Math.round(rect.x + 30),
-                            click_y: Math.round(rect.y + rect.height / 2)
-                        };
+                        return {x:rect.x, y:rect.y, width:rect.width, height:rect.height,
+                                click_x:Math.round(rect.x+30), click_y:Math.round(rect.y+rect.height/2)};
                     }
                 }
             }
@@ -434,21 +606,14 @@ def get_turnstile_checkbox_coords(sb):
                     if (!container) break;
                     var rect = container.getBoundingClientRect();
                     if (rect.width > 100 && rect.height > 30) {
-                        return {
-                            x: rect.x,
-                            y: rect.y,
-                            width: rect.width,
-                            height: rect.height,
-                            click_x: Math.round(rect.x + 30),
-                            click_y: Math.round(rect.y + rect.height / 2)
-                        };
+                        return {x:rect.x, y:rect.y, width:rect.width, height:rect.height,
+                                click_x:Math.round(rect.x+30), click_y:Math.round(rect.y+rect.height/2)};
                     }
                     container = container.parentElement;
                 }
             }
             return null;
         """)
-        return coords
     except:
         return None
 
@@ -492,56 +657,40 @@ def xdotool_click(x, y):
 def click_turnstile_checkbox(sb):
     coords = get_turnstile_checkbox_coords(sb)
     if not coords:
-        print("[!] 无法获取 Turnstile 坐标")
+        print("[WARN] 无法获取 Turnstile 坐标")
         return False
-
-    print(f"[*] Turnstile 位置: ({coords['x']:.0f}, {coords['y']:.0f}) "
-          f"{coords['width']:.0f}x{coords['height']:.0f}")
 
     try:
         window_info = sb.execute_script("""
-            return {
-                screenX: window.screenX || 0,
-                screenY: window.screenY || 0,
-                outerHeight: window.outerHeight,
-                innerHeight: window.innerHeight
-            };
+            return {screenX:window.screenX||0, screenY:window.screenY||0,
+                    outerHeight:window.outerHeight, innerHeight:window.innerHeight};
         """)
         chrome_bar_height = window_info["outerHeight"] - window_info["innerHeight"]
         abs_x = coords["click_x"] + window_info["screenX"]
         abs_y = coords["click_y"] + window_info["screenY"] + chrome_bar_height
-        print(f"[*] 点击坐标: ({abs_x:.0f}, {abs_y:.0f})")
         return xdotool_click(abs_x, abs_y)
     except Exception as e:
-        print(f"[!] 坐标计算失败: {e}")
+        print(f"[ERROR] 坐标计算失败: {e}")
         return False
 
 
 def check_result_popup(sb):
     try:
-        result = sb.execute_script("""
+        return sb.execute_script("""
             var buttons = document.querySelectorAll('button');
             var hasNextBtn = false;
             for (var i = 0; i < buttons.length; i++) {
                 if (buttons[i].innerText.includes('NEXT') || buttons[i].innerText.includes('Next')) {
-                    hasNextBtn = true;
-                    break;
+                    hasNextBtn = true; break;
                 }
             }
             var bodyText = document.body.innerText || '';
             var hasSuccessTitle = bodyText.includes('Success');
-            var hasSuccessContent = bodyText.includes('성공') || 
-                                    bodyText.includes('갱신') ||
-                                    bodyText.includes('연장');
-            var hasCooldown = bodyText.includes('아직') || 
-                              bodyText.includes('Error');
+            var hasSuccessContent = bodyText.includes('성공') || bodyText.includes('갱신') || bodyText.includes('연장');
+            var hasCooldown = bodyText.includes('아직') || bodyText.includes('Error');
             if (hasNextBtn || hasSuccessTitle) {
-                if (hasCooldown && bodyText.includes('아직')) {
-                    return 'cooldown';
-                }
-                if (hasSuccessTitle && hasSuccessContent) {
-                    return 'success';
-                }
+                if (hasCooldown && bodyText.includes('아직')) return 'cooldown';
+                if (hasSuccessTitle && hasSuccessContent) return 'success';
                 if (hasNextBtn) {
                     if (hasCooldown) return 'cooldown';
                     if (hasSuccessContent) return 'success';
@@ -549,7 +698,6 @@ def check_result_popup(sb):
             }
             return null;
         """)
-        return result
     except:
         return None
 
@@ -557,17 +705,15 @@ def check_result_popup(sb):
 def check_popup_still_open(sb):
     try:
         return sb.execute_script("""
-            var turnstileInput = document.querySelector('input[name="cf-turnstile-response"]');
-            if (!turnstileInput) return false;
+            var t = document.querySelector('input[name="cf-turnstile-response"]');
+            if (!t) return false;
             var buttons = document.querySelectorAll('button');
             for (var i = 0; i < buttons.length; i++) {
                 var text = buttons[i].innerText || '';
-                // 更新检测逻辑 - 支持新旧按钮文本
-                if ((text.includes('시간추가') || text.includes('시간 추가') || text.includes('연장하기')) && !text.includes('DELETE')) {
+                if ((text.includes('시간추가') || text.includes('시간 추가') || text.includes('연장하기'))
+                    && !text.includes('DELETE')) {
                     var rect = buttons[i].getBoundingClientRect();
-                    if (rect.x > 200 && rect.width > 0) {
-                        return true;
-                    }
+                    if (rect.x > 200 && rect.width > 0) return true;
                 }
             }
             return false;
@@ -578,15 +724,14 @@ def check_popup_still_open(sb):
 
 def click_next_button(sb):
     try:
-        next_selectors = [
+        for sel in [
             "//button[contains(text(), 'NEXT')]",
             "//button[contains(text(), 'Next')]",
             "//button//span[contains(text(), 'NEXT')]",
-        ]
-        for sel in next_selectors:
+        ]:
             if sb.is_element_visible(sel):
                 sb.click(sel)
-                print("[+] 已点击 NEXT 按钮")
+                print("[INFO] 已点击 NEXT 按钮")
                 return True
     except:
         pass
@@ -596,429 +741,494 @@ def click_next_button(sb):
 def handle_renewal_popup(sb, screenshot_prefix="", timeout=90):
     screenshot_name = f"{screenshot_prefix}_popup.png" if screenshot_prefix else "popup_fixed.png"
 
-    print("\n[阶段1] 等待弹窗和 Turnstile...")
+    print("[INFO]   [阶段1] 等待弹窗和 Turnstile...")
 
     turnstile_ready = False
     for _ in range(20):
         result = check_result_popup(sb)
         if result == "cooldown":
-            print("[*] 检测到冷却期弹窗")
+            print("[INFO]   检测到冷却期弹窗")
             sb.save_screenshot(screenshot_name)
             return {"status": "cooldown", "screenshot": screenshot_name}
         if result == "success":
-            print("[+] 检测到成功弹窗")
+            print("[INFO]   检测到成功弹窗")
             sb.save_screenshot(screenshot_name)
             return {"status": "success", "screenshot": screenshot_name}
         if check_turnstile_exists(sb):
             turnstile_ready = True
-            print("[+] 检测到 Turnstile")
+            print("[INFO]   检测到 Turnstile")
             break
         time.sleep(1)
 
     if not turnstile_ready:
-        print("[!] 未检测到 Turnstile")
+        print("[WARN]   未检测到 Turnstile")
         sb.save_screenshot(screenshot_name)
         return {"status": "error", "message": "未检测到 Turnstile", "screenshot": screenshot_name}
 
-    print("\n[阶段2] 修复弹窗样式...")
-
+    print("[INFO]   [阶段2] 修复弹窗样式...")
     for _ in range(3):
         sb.execute_script(EXPAND_POPUP_JS)
         time.sleep(0.5)
-
     sb.save_screenshot(screenshot_name)
 
-    print("\n[阶段3] 点击 Turnstile 并等待结果...")
-
+    print("[INFO]   [阶段3] 点击 Turnstile...")
     for attempt in range(6):
-        print(f"\n  --- 尝试 {attempt + 1}/6 ---")
         if check_turnstile_solved(sb):
-            print("[+] Turnstile 已通过!")
+            print("[INFO]   Turnstile 已通过!")
             break
         sb.execute_script(EXPAND_POPUP_JS)
         time.sleep(0.3)
         click_turnstile_checkbox(sb)
-        print("[*] 等待 Turnstile 验证...")
         for _ in range(8):
             time.sleep(0.5)
             if check_turnstile_solved(sb):
-                print("[+] Turnstile 已通过!")
+                print("[INFO]   Turnstile 已通过!")
                 break
         if check_turnstile_solved(sb):
             break
-        sb.save_screenshot(f"{screenshot_prefix}_turnstile_{attempt}.png" if screenshot_prefix else f"turnstile_attempt_{attempt}.png")
+        sb.save_screenshot(
+            f"{screenshot_prefix}_turnstile_{attempt}.png" if screenshot_prefix
+            else f"turnstile_attempt_{attempt}.png"
+        )
 
-    print("\n[*] 等待自动提交和结果弹窗...")
-
-    result_timeout = 45
+    print("[INFO]   等待提交结果...")
     result_start = time.time()
     last_screenshot_time = 0
 
-    while time.time() - result_start < result_timeout:
+    while time.time() - result_start < 45:
         result = check_result_popup(sb)
         if result == "success":
-            print("[+] 续期成功!")
+            print("[INFO]   续期成功!")
             sb.save_screenshot(screenshot_name)
             time.sleep(1)
             click_next_button(sb)
             return {"status": "success", "screenshot": screenshot_name}
         if result == "cooldown":
-            print("[*] 冷却期内")
+            print("[INFO]   冷却期内")
             sb.save_screenshot(screenshot_name)
             time.sleep(1)
             click_next_button(sb)
             return {"status": "cooldown", "screenshot": screenshot_name}
         if not check_popup_still_open(sb):
-            print("[*] 弹窗已消失，检查结果...")
             time.sleep(2)
             result = check_result_popup(sb)
             if result:
                 sb.save_screenshot(screenshot_name)
                 if result == "success":
-                    print("[+] 续期成功!")
                     click_next_button(sb)
                     return {"status": "success", "screenshot": screenshot_name}
                 elif result == "cooldown":
-                    print("[*] 冷却期内")
                     click_next_button(sb)
                     return {"status": "cooldown", "screenshot": screenshot_name}
         if time.time() - last_screenshot_time > 5:
             sb.save_screenshot(screenshot_name)
             last_screenshot_time = time.time()
-            print(f"[*] 等待中... ({int(time.time() - result_start)}s)")
         time.sleep(1)
 
-    print("[!] 等待结果超时")
+    print("[WARN]   等待结果超时")
     sb.save_screenshot(screenshot_name)
     return {"status": "timeout", "screenshot": screenshot_name}
 
 
-def check_and_update_cookie(sb, cookie_env, original_cookie_value):
-    print("\n[Cookie检查] 开始检查 Cookie 变化...")
+def check_and_update_cookie(sb, cookie_env, original_cookie_value, remark=""):
+    """检查浏览器 Cookie 变化，变化时更新 GitHub Secret（保持 备注-----cookie 格式）"""
     try:
         cookies = sb.get_cookies()
         for cookie in cookies:
             if cookie.get("name", "").startswith("remember_web"):
                 new_val = cookie.get("value", "")
-                cookie_name = cookie.get("name", "")
-                print(f"[Cookie检查] 当前 Cookie: {cookie_name[:20]}...{cookie_name[-10:]}")
-                print(f"[Cookie检查] 原值: ...{original_cookie_value[-20:]}")
-                print(f"[Cookie检查] 新值: ...{new_val[-20:] if new_val else 'N/A'}")
+                c_name = cookie.get("name", "")
                 if new_val and new_val != original_cookie_value:
-                    new_cookie_str = f"{cookie_name}={new_val}"
-                    print(f"[Cookie检查] ⚡ 检测到 Cookie 变化!")
-                    print(f"[Cookie检查] 正在更新 GitHub Secret: {cookie_env}...")
-                    if asyncio.run(update_github_secret(cookie_env, new_cookie_str)):
-                        print(f"[Cookie检查] ✅ {cookie_env} 已成功更新到 GitHub Secrets")
+                    new_cookie_str = f"{c_name}={new_val}"
+                    if remark:
+                        new_secret_value = f"{remark}-----{new_cookie_str}"
+                    else:
+                        new_secret_value = new_cookie_str
+                    print(f"[INFO]   Cookie 已变化，更新 {cookie_env}...")
+                    if asyncio.run(update_github_secret(cookie_env, new_secret_value)):
+                        print(f"[INFO]   ✅ {cookie_env} 已更新")
                         return True
                     else:
-                        print(f"[Cookie检查] ❌ {cookie_env} 更新失败")
+                        print(f"[ERROR]  ❌ {cookie_env} 更新失败")
                         return False
-                else:
-                    print(f"[Cookie检查] ℹ️ Cookie 未变化，无需更新")
                 break
     except Exception as e:
-        print(f"[Cookie检查] ❌ 检查失败: {e}")
+        print(f"[ERROR]  Cookie 检查失败: {e}")
     return False
 
 
-def process_single_account(sb, account, account_index):
-    remark = account.get("remark", f"账号{account_index + 1}")
-    server_id = account.get("id", "").strip()
-    cookie_env = account.get("cookie_env", "").strip()
-    display_name = mask_email(remark) if "@" in remark else remark
+# ============================================================
+#  单个服务器的续期处理
+# ============================================================
 
-    result = {
-        "remark": remark,
-        "display_name": display_name,
+def process_single_server(sb, server_info, cookie_name, cookie_value, cookie_str,
+                          cookie_env, remark, screenshot_prefix):
+    server_id = server_info.get("identifier", "Unknown")
+    server_uuid = server_info.get("uuid", "")
+    server_type = server_info.get("server_type", "notfree")
+    server_name = server_info.get("name", "")
+    api_expiry = server_info.get("expire", "Unknown")
+
+    srv_result = {
         "server_id": server_id,
-        "cookie_env": cookie_env,
+        "server_uuid": server_uuid,
+        "server_type": server_type,
+        "server_name": server_name,
         "status": "unknown",
-        "original_expiry": "Unknown",
-        "new_expiry": "Unknown",
+        "original_expiry": api_expiry,
+        "new_expiry": api_expiry,
         "message": "",
         "screenshot": None,
         "cookie_updated": False,
-        "skipped": False
     }
 
-    print(f"\n{'=' * 60}")
-    print(f"处理账号 [{account_index + 1}]: {display_name}")
-    print(f"{'=' * 60}")
-
-    if not server_id:
-        print(f"[!] 账号 {display_name}: 缺少 id")
-        result["status"] = "error"
-        result["message"] = "缺少 id"
-        return result
-
-    if not cookie_env:
-        print(f"[!] 账号 {display_name}: 缺少 cookie_env")
-        result["status"] = "error"
-        result["message"] = "缺少 cookie_env"
-        return result
-
-    cookie_str = os.environ.get(cookie_env, "").strip()
-    if not cookie_str:
-        print(f"[!] 账号 {display_name}: 环境变量 {cookie_env} 未设置")
-        print(f"    请在 GitHub Secrets 中添加 {cookie_env}")
-        print(f"    格式: remember_web_xxxxxx=xxxxxx")
-        result["status"] = "error"
-        result["message"] = f"{cookie_env} 未设置"
-        return result
-
-    cookie_name, cookie_value = parse_weirdhost_cookie(cookie_str)
     server_url = build_server_url(server_id)
+    rd = get_remaining_days(api_expiry)
+    dd = format_remaining_days(rd)
 
-    if not cookie_name or not cookie_value:
-        print(f"[!] 账号 {display_name}: Cookie 格式错误")
-        print(f"    正确格式: remember_web_xxxxxx=xxxxxx")
-        result["status"] = "error"
-        result["message"] = "Cookie 格式错误"
-        return result
-
-    if not cookie_name.startswith("remember_web"):
-        print(f"[!] 账号 {display_name}: Cookie 名称错误")
-        print(f"    Cookie 名称应以 'remember_web' 开头")
-        result["status"] = "error"
-        result["message"] = "Cookie 名称错误"
-        return result
-
-    masked_server_id = mask_server_id(server_id)
-    masked_url = mask_url(server_url)
-
-    print(f"[*] 环境变量: {cookie_env}")
-    print(f"[*] 服务器ID: {masked_server_id}")
-    print(f"[*] URL: {masked_url}")
-
-    screenshot_prefix = f"account_{account_index + 1}"
+    # 日志中隐藏服务器ID
+    print(f"\n  {'─' * 50}")
+    print(f"  [INFO] 服务器: {mask_server_id(server_id)} [{server_type}] {server_name}")
+    print(f"  [INFO] 到期: {api_expiry} | 剩余: {calculate_remaining_time(api_expiry)} ({dd}天)")
+    print(f"  [INFO] 访问服务器页面...")
 
     try:
-        print("\n[步骤1] 设置 Cookie")
-        try:
-            sb.uc_open_with_reconnect(f"https://{DOMAIN}", reconnect_time=3)
-            time.sleep(1)
-            sb.delete_all_cookies()
-        except:
-            pass
-
-        sb.uc_open_with_reconnect(f"https://{DOMAIN}", reconnect_time=3)
-        time.sleep(2)
-        sb.add_cookie({
-            "name": cookie_name, "value": cookie_value,
-            "domain": DOMAIN, "path": "/"
-        })
-        print("[+] Cookie 已设置")
-
-        print("\n[步骤2] 获取到期时间")
         sb.uc_open_with_reconnect(server_url, reconnect_time=5)
         time.sleep(3)
 
         if not is_logged_in(sb):
-            sb.add_cookie({
-                "name": cookie_name, "value": cookie_value,
-                "domain": DOMAIN, "path": "/"
-            })
+            sb.add_cookie({"name": cookie_name, "value": cookie_value, "domain": DOMAIN, "path": "/"})
             sb.uc_open_with_reconnect(server_url, reconnect_time=5)
             time.sleep(3)
 
         if not is_logged_in(sb):
-            screenshot_path = f"{screenshot_prefix}_login_failed.png"
-            sb.save_screenshot(screenshot_path)
-            result["status"] = "error"
-            result["message"] = "Cookie 失效，请重新获取"
-            result["screenshot"] = screenshot_path
-            return result
+            ss_path = f"{screenshot_prefix}_login_fail.png"
+            sb.save_screenshot(ss_path)
+            srv_result.update(status="error", message="浏览器登录失败", screenshot=ss_path)
+            print(f"  [ERROR] 浏览器登录失败")
+            return srv_result
 
-        print("[+] 登录成功")
+        print(f"  [INFO] 登录成功")
 
-        original_expiry = get_expiry_from_page(sb)
-        remaining = calculate_remaining_time(original_expiry)
-        remaining_days = get_remaining_days(original_expiry)
-        result["original_expiry"] = original_expiry
+        page_expiry = get_expiry_from_page(sb)
+        if page_expiry != "Unknown":
+            srv_result["original_expiry"] = page_expiry
 
-        print(f"[*] 到期: {original_expiry}")
-        print(f"[*] 剩余: {remaining}")
-        if remaining_days is not None:
-            print(f"[*] 剩余天数: {remaining_days:.2f} 天")
+        # 检查续期按钮
+        print(f"  [INFO] 检查续期按钮...")
+        btn_found, btn_enabled, btn_xpath, btn_reason = check_renewal_button_enabled(sb)
 
-        print(f"\n[步骤3] 检查是否需要续期 (阈值: {RENEW_THRESHOLD_DAYS} 天)")
+        if not btn_found:
+            print(f"  [WARN] {btn_reason}")
+            ss_path = f"{screenshot_prefix}_no_btn.png"
+            sb.save_screenshot(ss_path)
+            srv_result.update(status="skipped", message=btn_reason, screenshot=ss_path)
+            return srv_result
 
-        need_renew = should_renew(original_expiry)
+        if not btn_enabled:
+            print(f"  [WARN] {btn_reason}")
+            ss_path = f"{screenshot_prefix}_btn_disabled.png"
+            sb.save_screenshot(ss_path)
+            srv_result.update(status="skipped", message=btn_reason, screenshot=ss_path)
+            return srv_result
 
-        if not need_renew:
-            print(f"[*] 剩余 {remaining_days:.2f} 天 > {RENEW_THRESHOLD_DAYS} 天，跳过续期")
-            result["status"] = "skipped"
-            result["skipped"] = True
-            result["new_expiry"] = original_expiry
-            result["message"] = f"剩余 {remaining_days:.1f} 天，无需续期"
-            if check_and_update_cookie(sb, cookie_env, cookie_value):
-                result["cookie_updated"] = True
-            return result
+        print(f"  [INFO] 续期按钮可用，执行续期")
 
-        remaining_display = f"{remaining_days:.2f}" if remaining_days is not None else "?"
-        print(f"[+] 剩余 {remaining_display} 天 <= {RENEW_THRESHOLD_DAYS} 天，执行续期")
-
-        print("\n[步骤4] 点击续期按钮")
         random_delay(1.0, 2.0)
-
-        # 更新按钮选择器 - 支持新旧按钮文本
-        renewal_button_selectors = [
-            "//button//span[contains(text(), '연장하기')]/parent::button",
-            "//button[contains(text(), '연장하기')]",
-            "//button//span[contains(text(), '시간추가')]/parent::button", 
-            "//button[contains(text(), '시간추가')]",
-            "//button//span[contains(text(), '시간 추가')]/parent::button",
-            "//button[contains(text(), '시간 추가')]"
-        ]
-
-        renewal_btn_xpath = None
-        for selector in renewal_button_selectors:
-            if sb.is_element_present(selector):
-                renewal_btn_xpath = selector
-                print(f"[+] 找到续期按钮: {selector}")
-                break
-
-        if not renewal_btn_xpath:
-            screenshot_path = f"{screenshot_prefix}_no_button.png"
-            sb.save_screenshot(screenshot_path)
-            result["status"] = "error"
-            result["message"] = "未找到续期按钮"
-            result["screenshot"] = screenshot_path
-            return result
-
-        sb.click(renewal_btn_xpath)
-        print("[+] 已点击续期按钮，等待弹窗...")
+        sb.click(btn_xpath)
+        print(f"  [INFO] 已点击续期按钮，等待弹窗...")
         time.sleep(3)
 
-        print("\n[步骤5] 处理续期弹窗")
         popup_result = handle_renewal_popup(sb, screenshot_prefix=screenshot_prefix, timeout=90)
-        print(f"\n[*] 处理结果: {popup_result['status']}")
+        srv_result["screenshot"] = popup_result.get("screenshot")
 
-        result["screenshot"] = popup_result.get("screenshot")
-
-        print("\n[步骤6] 验证续期结果")
+        # 验证结果
         time.sleep(3)
+        if server_uuid:
+            new_info = get_server_info_via_api(cookie_str, server_uuid, server_type)
+            new_expiry = new_info.get("expire", "Unknown") if new_info else srv_result["original_expiry"]
+        else:
+            sb.uc_open_with_reconnect(server_url, reconnect_time=3)
+            time.sleep(3)
+            new_expiry = get_expiry_from_page(sb)
 
-        sb.uc_open_with_reconnect(server_url, reconnect_time=3)
-        time.sleep(3)
+        srv_result["new_expiry"] = new_expiry
 
-        new_expiry = get_expiry_from_page(sb)
-        result["new_expiry"] = new_expiry
-
-        print(f"[*] 原到期: {original_expiry}")
-        print(f"[*] 新到期: {new_expiry}")
-
-        original_dt = parse_expiry_to_datetime(original_expiry)
+        original_dt = parse_expiry_to_datetime(srv_result["original_expiry"])
         new_dt = parse_expiry_to_datetime(new_expiry)
 
         if popup_result["status"] == "cooldown":
-            result["status"] = "cooldown"
-            result["message"] = "冷却期内"
+            srv_result.update(status="cooldown", message="冷却期内")
+            print(f"  [INFO] 冷却期内")
         elif original_dt and new_dt and new_dt > original_dt:
             diff_h = (new_dt - original_dt).total_seconds() / 3600
-            result["status"] = "success"
-            result["message"] = f"延长了 {diff_h:.1f} 小时"
-            print(f"\n[+] 成功！延长 {diff_h:.1f} 小时")
+            srv_result.update(status="success", message=f"延长了 {diff_h:.1f} 小时")
+            print(f"  [INFO] ✅ 续期成功！延长 {diff_h:.1f} 小时")
         elif popup_result["status"] == "success":
-            result["status"] = "success"
-            result["message"] = "操作完成"
+            srv_result.update(status="success", message="操作完成")
+            print(f"  [INFO] ✅ 续期成功")
         else:
-            result["status"] = popup_result["status"]
-            result["message"] = popup_result.get("message", "未知状态")
+            srv_result.update(status=popup_result["status"], message=popup_result.get("message", "未知"))
+            print(f"  [WARN] 结果: {popup_result['status']}")
 
-        print("\n[步骤7] 检查 Cookie 更新")
-        if check_and_update_cookie(sb, cookie_env, cookie_value):
-            result["cookie_updated"] = True
+        if check_and_update_cookie(sb, cookie_env, cookie_value, remark):
+            srv_result["cookie_updated"] = True
+
+        if not srv_result["screenshot"] or not os.path.exists(srv_result["screenshot"]):
+            final_ss = f"{screenshot_prefix}_final.png"
+            sb.save_screenshot(final_ss)
+            srv_result["screenshot"] = final_ss
 
     except Exception as e:
         import traceback
-        print(f"\n[!] 账号 {display_name} 处理异常: {repr(e)}")
+        print(f"  [ERROR] 异常: {repr(e)}")
         traceback.print_exc()
+        srv_result.update(status="error", message=str(e)[:100])
+        try:
+            ss_path = f"{screenshot_prefix}_error.png"
+            sb.save_screenshot(ss_path)
+            srv_result["screenshot"] = ss_path
+        except:
+            pass
+
+    return srv_result
+
+
+# ============================================================
+#  单个账号的处理
+# ============================================================
+
+def process_single_account(sb, account, account_index):
+    remark = account.get("remark", f"账号{account_index + 1}")
+    cookie_env = account.get("cookie_env", "")
+    cookie_str = account.get("cookie_str", "")
+    cookie_name = account.get("cookie_name", "")
+    cookie_value = account.get("cookie_value", "")
+
+    result = {
+        "remark": remark,
+        "cookie_env": cookie_env,
+        "email": "Unknown",
+        "status": "unknown",
+        "message": "",
+        "servers": [],
+        "cookie_updated": False,
+    }
+
+    print(f"\n{'=' * 60}")
+    print(f"[INFO] 处理账号 [{account_index + 1}]: {remark} ({cookie_env})")
+    print(f"{'=' * 60}")
+
+    # Step 1: Cookie 有效性
+    print(f"[INFO] [步骤1] 检查 Cookie 有效性...")
+    if not check_cookie_valid(cookie_str):
+        print(f"[ERROR] Cookie 已失效")
+        result["status"] = "cookie_invalid"
+        result["message"] = "Cookie 失效，请重新获取"
+        return result
+    print(f"[INFO] ✅ Cookie 有效")
+
+    # Step 2: API 获取信息
+    print(f"[INFO] [步骤2] API 获取账号信息...")
+    account_info = get_account_info_via_api(cookie_str)
+    if not account_info:
+        print(f"[ERROR] API 调用失败")
         result["status"] = "error"
-        result["message"] = str(e)[:100]
+        result["message"] = "API 调用失败"
+        return result
+
+    email = account_info.get("email", "Unknown")
+    servers = account_info.get("servers", [])
+    result["email"] = email
+
+    # 日志中隐藏邮箱
+    if email and email != "Unknown":
+        print(f"[INFO] 邮箱: {mask_email(email)}")
+
+    if not servers:
+        print(f"[WARN] 该账号下没有服务器")
+        result["status"] = "no_server"
+        result["message"] = "该账号下没有服务器"
+        return result
+
+    # 日志中隐藏服务器ID
+    print(f"[INFO] 找到 {len(servers)} 个服务器:")
+    for s in servers:
+        sid = s.get("identifier", "?")
+        stype = s.get("server_type", "?")
+        sname = s.get("name", "")
+        sexpire = s.get("expire", "Unknown")
+        print(f"  - {mask_server_id(sid)} [{stype}] {sname} | 到期: {sexpire}")
+
+    # Step 3: 设置 Cookie
+    print(f"[INFO] [步骤3] 设置浏览器 Cookie...")
+    try:
+        sb.uc_open_with_reconnect(f"https://{DOMAIN}", reconnect_time=3)
+        time.sleep(1)
+        sb.delete_all_cookies()
+    except:
+        pass
+    sb.uc_open_with_reconnect(f"https://{DOMAIN}", reconnect_time=3)
+    time.sleep(2)
+    sb.add_cookie({"name": cookie_name, "value": cookie_value, "domain": DOMAIN, "path": "/"})
+    print(f"[INFO] Cookie 已设置")
+
+    # Step 4: 逐个服务器
+    print(f"[INFO] [步骤4] 逐个处理服务器续期...")
+    server_results = []
+
+    for srv_idx, server in enumerate(servers):
+        ss_prefix = f"acc{account_index + 1}_srv{srv_idx + 1}"
+        srv_result = process_single_server(
+            sb, server, cookie_name, cookie_value, cookie_str, cookie_env, remark, ss_prefix
+        )
+        server_results.append(srv_result)
+
+        if srv_result.get("cookie_updated"):
+            result["cookie_updated"] = True
+
+        if srv_idx < len(servers) - 1:
+            if srv_result.get("status") == "skipped":
+                wait = random.randint(2, 4)
+            else:
+                wait = random.randint(5, 10)
+            print(f"\n  [INFO] 等待 {wait} 秒后处理下一个服务器...")
+            time.sleep(wait)
+
+    result["servers"] = server_results
+
+    # 汇总
+    statuses = [s["status"] for s in server_results]
+    if "success" in statuses:
+        result["status"] = "success"
+        result["message"] = f"{statuses.count('success')}/{len(statuses)} 个服务器续期成功"
+    elif all(s == "skipped" for s in statuses):
+        result["status"] = "skipped"
+        result["message"] = "所有服务器均跳过"
+    elif "cooldown" in statuses:
+        result["status"] = "cooldown"
+        result["message"] = "冷却期内"
+    elif "error" in statuses or "timeout" in statuses:
+        result["status"] = "error"
+        err_count = statuses.count("error") + statuses.count("timeout")
+        result["message"] = f"{err_count}/{len(statuses)} 个服务器失败"
+    else:
+        result["status"] = statuses[0] if statuses else "unknown"
 
     return result
 
 
+# ============================================================
+#  TG 汇总报告（私人通知，显示完整信息）
+# ============================================================
+
 def send_summary_report(results):
-    """发送汇总报告到 Telegram"""
-    success_count = sum(1 for r in results if r["status"] == "success")
-    skipped_count = sum(1 for r in results if r["status"] == "skipped")
-    error_count = sum(1 for r in results if r["status"] in ["error", "timeout", "unknown", "cooldown"])
+    total_accounts = len(results)
+    total_servers = sum(len(r.get("servers", [])) for r in results)
+    success_servers = sum(
+        sum(1 for s in r.get("servers", []) if s["status"] == "success") for r in results
+    )
+    skipped_servers = sum(
+        sum(1 for s in r.get("servers", []) if s["status"] == "skipped") for r in results
+    )
+    failed_servers = sum(
+        sum(1 for s in r.get("servers", []) if s["status"] in ["error", "timeout", "cooldown"])
+        for r in results
+    )
 
     lines = [
-        "🎁 <b>Weirdhost 多账号续期报告</b>",
-        "",
-        f"📊 共 {len(results)} 个账号",
-        f"✅ 成功: {success_count}  ⏭️ 跳过: {skipped_count}  ❌ 失败: {error_count}",
-        "",
-        "━━━━━━━━━━━━━━━━━━━━━━"
+        f"🔔 <b>Weirdhost 续期报告</b>",
+        f"",
+        f"👤 账号: {total_accounts}  |  🖥 服务器: {total_servers}",
+        f"✅ {success_servers}  ⏭️ {skipped_servers}  ❌ {failed_servers}",
     ]
 
     for i, r in enumerate(results):
-        status_icon = {
-            "success": "✅",
-            "cooldown": "⏳",
-            "skipped": "⏭️",
-            "error": "❌",
-            "timeout": "⚠️"
-        }.get(r["status"], "❓")
-
+        remark = r.get("remark", f"账号{i+1}")
+        email = r.get("email", "Unknown")
         cookie_env = r.get("cookie_env", "")
         cookie_updated = r.get("cookie_updated", False)
-        server_id = r.get("server_id", "")
-        remark = r.get("remark", f"账号{i+1}")
+        server_list = r.get("servers", [])
 
-        lines.append(f"\n{status_icon} <b>{remark}</b>")
+        acct_icon = {
+            "success": "✅", "cooldown": "⏳", "skipped": "⏭️",
+            "error": "❌", "timeout": "⚠️", "cookie_invalid": "🔒",
+            "no_server": "📭",
+        }.get(r["status"], "❓")
 
-        if server_id:
-            lines.append(f"   🖥️ 服务器: {mask_server_id(server_id)}")
+        # TG 通知：显示完整邮箱（私人）
+        lines.append(f"")
+        lines.append(f"━━━━━━━━━━━━━━━━━━━━")
+        acct_title = f"{acct_icon} <b>{remark}</b>"
+        if email and email != "Unknown":
+            acct_title += f"  ({email})"
+        lines.append(acct_title)
 
-        if r["status"] == "success":
-            lines.append(f"   📅 到期: {r['new_expiry']}")
-            lines.append(f"   ⏳ 剩余: {calculate_remaining_time(r['new_expiry'])}")
-            if r.get("message"):
-                lines.append(f"   📝 {r['message']}")
-            if cookie_env:
-                if cookie_updated:
-                    lines.append(f"   🔑 Cookie: ✅ 已自动更新")
-                else:
-                    lines.append(f"   🔑 Cookie: 无变化")
+        if not server_list:
+            lines.append(f"  ⚠️ {r.get('message', '未知错误')}")
+            if cookie_updated:
+                lines.append(f"  🔑 Cookie 已自动更新")
+            continue
 
-        elif r["status"] == "skipped":
-            lines.append(f"   📅 到期: {r['original_expiry']}")
-            lines.append(f"   ⏳ 剩余: {calculate_remaining_time(r['original_expiry'])}")
-            lines.append(f"   💡 {r.get('message', '无需续期')}")
-            if cookie_env:
-                if cookie_updated:
-                    lines.append(f"   🔑 Cookie: ✅ 已自动更新")
-                else:
-                    lines.append(f"   🔑 Cookie: 无变化")
+        for s in server_list:
+            # TG 通知：显示完整服务器ID（私人）
+            sid = s.get("server_id", "?")
+            stype = s.get("server_type", "?")
+            sname = s.get("server_name", "")
+            status = s["status"]
 
-        elif r["status"] == "cooldown":
-            lines.append(f"   📅 到期: {r['original_expiry']}")
-            lines.append(f"   ⏳ 剩余: {calculate_remaining_time(r['original_expiry'])}")
-            lines.append(f"   💡 冷却期内，暂时无法续期")
-            if cookie_env:
-                if cookie_updated:
-                    lines.append(f"   🔑 Cookie: ✅ 已自动更新")
-                else:
-                    lines.append(f"   🔑 Cookie: 无变化")
+            srv_icon = {
+                "success": "✅", "cooldown": "⏳", "skipped": "⏭️",
+                "error": "❌", "timeout": "⚠️",
+            }.get(status, "❓")
 
-        else:
-            lines.append(f"   ⚠️ {r.get('message', '未知错误')}")
-            if cookie_env and cookie_updated:
-                lines.append(f"   🔑 Cookie: ✅ 已自动更新")
+            type_label = "💰" if stype == "notfree" else "🆓" if stype == "free" else "❓"
+
+            lines.append(f"")
+            lines.append(f"  {srv_icon} {type_label} <code>{sid}</code>")
+            if sname:
+                lines.append(f"      {sname}")
+
+            if status == "success":
+                new_exp = s.get("new_expiry", "Unknown")
+                lines.append(f"      📅 {new_exp}")
+                lines.append(f"      ⏳ 剩余 {calculate_remaining_time(new_exp)}")
+                msg = s.get("message", "")
+                if msg:
+                    lines.append(f"      📝 {msg}")
+
+            elif status == "skipped":
+                expiry = s.get("original_expiry", s.get("new_expiry", "Unknown"))
+                lines.append(f"      📅 {expiry}")
+                lines.append(f"      ⏳ 剩余 {calculate_remaining_time(expiry)}")
+                msg = s.get("message", "")
+                if msg:
+                    lines.append(f"      💡 {msg}")
+
+            elif status == "cooldown":
+                expiry = s.get("original_expiry", "Unknown")
+                lines.append(f"      📅 {expiry}")
+                lines.append(f"      ⏳ 剩余 {calculate_remaining_time(expiry)}")
+                lines.append(f"      💡 冷却中")
+
+            else:
+                lines.append(f"      ⚠️ {s.get('message', '未知错误')}")
+
+        if cookie_updated:
+            lines.append(f"  🔑 Cookie 已自动更新")
 
     message = "\n".join(lines)
 
+    # 找截图
     screenshot = None
     for r in results:
-        if r["status"] in ["success", "cooldown", "error", "timeout"]:
-            if r.get("screenshot") and os.path.exists(r["screenshot"]):
-                screenshot = r["screenshot"]
-                break
+        for s in r.get("servers", []):
+            if s["status"] in ["success", "cooldown", "error", "timeout"]:
+                if s.get("screenshot") and os.path.exists(s["screenshot"]):
+                    screenshot = s["screenshot"]
+                    break
+        if screenshot:
+            break
 
     if screenshot:
         sync_tg_notify_photo(screenshot, message)
@@ -1026,26 +1236,38 @@ def send_summary_report(results):
         sync_tg_notify(message)
 
 
+# ============================================================
+#  主函数
+# ============================================================
+
 def add_server_time():
-    """主函数"""
-    accounts = parse_accounts()
+    accounts = detect_accounts()
 
     if not accounts:
+        print("\n" + "=" * 60)
+        print("[ERROR] 未检测到任何有效的账号配置")
+        print("=" * 60)
+        print("\n请在 GitHub Secrets 中设置 WEIRDHOST_COOKIE_1 ~ WEIRDHOST_COOKIE_5")
+        print("\n格式: 备注-----remember_web_xxx=yyy")
+        print("示例: 我的账号-----remember_web_59ba36addc2b2f940CCCC=XXXXXXXXXXX")
+        print("\n也支持纯 Cookie 格式 (无备注):")
+        print("  remember_web_59ba36addc2b2f940CCCC=XXXXXXXXXXX")
+        print("=" * 60)
+
         sync_tg_notify(
-            "🎁 <b>Weirdhost 多账号续期</b>\n\n"
-            "❌ <b>配置错误</b>\n\n"
-            "ACCOUNTS 环境变量未设置或格式错误\n\n"
-            "请在 GitHub Secrets 中设置 WEIRDHOST_ACCOUNTS 变量\n"
-            "格式为 JSON 数组，包含 remark, id, cookie_env 字段\n\n"
-            "详细说明请查看 Action 运行日志"
+            "🔔 <b>Weirdhost 续期</b>\n\n"
+            "❌ 未检测到任何有效的 WEIRDHOST_COOKIE_N\n\n"
+            "请在 GitHub Secrets 中设置:\n"
+            "<code>WEIRDHOST_COOKIE_1</code>\n"
+            "格式: <code>备注-----remember_web_xxx=yyy</code>"
         )
-        print("\n[!] 程序退出: 无有效账号配置")
         return
 
     print("=" * 60)
-    print(f"Weirdhost 自动续期 (稳定版)")
-    print(f"共 {len(accounts)} 个账号")
-    print(f"续期阈值: {RENEW_THRESHOLD_DAYS} 天")
+    print(f"[INFO] Weirdhost 自动续期")
+    print(f"[INFO] 共 {len(accounts)} 个账号")
+    print(f"[INFO] 续期策略: 检查续期按钮是否可用")
+    print(f"[INFO] 服务器发现: API 自动查找")
     print("=" * 60)
 
     results = []
@@ -1058,30 +1280,46 @@ def add_server_time():
             headless=False,
             chromium_arg="--disable-dev-shm-usage,--no-sandbox,--disable-gpu,--disable-software-rasterizer,--disable-background-timer-throttling"
         ) as sb:
-            print("\n[*] 浏览器已启动")
+            print("\n[INFO] 浏览器已启动")
 
             for i, account in enumerate(accounts):
                 result = process_single_account(sb, account, i)
                 results.append(result)
 
                 if i < len(accounts) - 1:
-                    if result.get("skipped"):
+                    if result.get("status") == "skipped":
                         wait_time = random.randint(2, 4)
                     else:
                         wait_time = random.randint(5, 10)
-                    print(f"\n[*] 等待 {wait_time} 秒后处理下一个账号...")
+                    print(f"\n[INFO] 等待 {wait_time} 秒后处理下一个账号...")
                     time.sleep(wait_time)
 
     except Exception as e:
         import traceback
-        print(f"\n[!] 浏览器异常: {repr(e)}")
+        print(f"\n[ERROR] 浏览器异常: {repr(e)}")
         traceback.print_exc()
 
         if results:
             send_summary_report(results)
         else:
-            sync_tg_notify(f"🎁 <b>Weirdhost</b>\n\n❌ 浏览器启动失败\n\n<code>{repr(e)}</code>")
+            sync_tg_notify(f"🔔 <b>Weirdhost</b>\n\n❌ 浏览器启动失败\n\n<code>{repr(e)}</code>")
         return
+
+    # 控制台摘要（隐藏敏感信息）
+    print(f"\n{'=' * 60}")
+    print("[INFO] 全部处理完成")
+    print(f"{'=' * 60}")
+    icons = {
+        "success": "🟢", "cooldown": "🟡", "skipped": "🔵",
+        "cookie_invalid": "🔒", "no_server": "📭",
+        "error": "❌", "timeout": "⚠️",
+    }
+    for r in results:
+        icon = icons.get(r["status"], "❓")
+        srv_count = len(r.get("servers", []))
+        email_display = mask_email(r.get("email", ""))
+        print(f"  {icon} {r.get('remark', '?')} ({email_display}) | "
+              f"{srv_count} 个服务器 | {r['status']} | {r.get('message', '')}")
 
     send_summary_report(results)
 
