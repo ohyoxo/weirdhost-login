@@ -64,6 +64,14 @@ def mask_email(email):
     return f"{masked_local}@{domain}"
 
 
+def mask_remark(remark):
+    if not remark:
+        return "***"
+    if "@" in remark:
+        return mask_email(remark)
+    return mask_sensitive(remark)
+
+
 def mask_server_id(server_id):
     if not server_id:
         return "***"
@@ -150,11 +158,6 @@ def build_server_url(server_id):
 # ============================================================
 
 def parse_account_config(raw_value):
-    """
-    解析环境变量值
-    格式: 备注-----remember_web_xxx=yyy
-    兼容: remember_web_xxx=yyy (无备注)
-    """
     if not raw_value:
         return None
     raw_value = raw_value.strip()
@@ -185,7 +188,6 @@ def parse_account_config(raw_value):
 
 
 def detect_accounts():
-    """自动扫描 WEIRDHOST_COOKIE_1 ~ WEIRDHOST_COOKIE_N"""
     accounts = []
     for i in range(1, MAX_COOKIE_COUNT + 1):
         env_name = f"WEIRDHOST_COOKIE_{i}"
@@ -200,7 +202,7 @@ def detect_accounts():
             continue
 
         remark = config["remark"] or f"账号{i}"
-        print(f"[INFO] 检测到 {env_name}: {remark}")
+        print(f"[INFO] 检测到 {env_name}: {mask_remark(remark)}")
 
         accounts.append({
             "index": i,
@@ -299,167 +301,204 @@ async def update_github_secret(secret_name, secret_value):
 
 
 # ============================================================
-#  WeirdHost API
+#  基于 Selenium 的浏览器内 API 调用
 # ============================================================
 
-class WeirdHostAPI:
-    def __init__(self, cookie_str):
-        self.cookie_name, self.cookie_value = parse_weirdhost_cookie(cookie_str)
-        self.xsrf_token = None
-        self.initialized = False
+def api_fetch_json(sb, url, xsrf_token=None):
+    headers = {
+        "Accept": "application/json",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": f"https://{DOMAIN}/",
+    }
+    if xsrf_token:
+        headers["X-XSRF-TOKEN"] = xsrf_token
 
-    async def init_session(self, session):
-        if self.initialized:
-            return True
-        if not self.cookie_name or not self.cookie_value:
-            return False
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "text/html,application/xhtml+xml",
-        }
-        session.cookie_jar.update_cookies({self.cookie_name: self.cookie_value})
-        try:
-            async with session.get(f"https://{DOMAIN}/", headers=headers) as resp:
-                if resp.status != 200:
-                    return False
-                for c in session.cookie_jar:
-                    if c.key == "XSRF-TOKEN":
-                        self.xsrf_token = unquote(c.value)
-                self.initialized = True
-                return True
-        except Exception as e:
-            print(f"[ERROR] API 初始化异常: {e}")
-            return False
-
-    async def api_request(self, session, endpoint):
-        if not self.initialized and not await self.init_session(session):
-            return None
-        headers = {
-            "Accept": "application/json",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "X-Requested-With": "XMLHttpRequest",
-            "Referer": f"https://{DOMAIN}/",
-        }
-        if self.xsrf_token:
-            headers["X-XSRF-TOKEN"] = self.xsrf_token
-        try:
-            async with session.get(f"{API_BASE_URL}{endpoint}", headers=headers) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-                elif resp.status == 401:
-                    return {"error": "unauthorized"}
-                return None
-        except Exception as e:
-            print(f"[ERROR] API 请求异常: {e}")
-            return None
-
-    async def get_account_email(self, session):
-        data = await self.api_request(session, "/account/activity?sort=-timestamp&page=1&include[]=actor")
-        if not data or data.get("error"):
-            return None
-        for item in data.get("data", []):
-            actor = item.get("attributes", {}).get("relationships", {}).get("actor", {})
-            if actor.get("object") == "user":
-                email = actor.get("attributes", {}).get("email")
-                if email:
-                    return email
+    script = """
+        var done = arguments[arguments.length - 1];
+        fetch(arguments[0], {
+            headers: arguments[1]
+        })
+        .then(resp => {
+            if (resp.status === 401) return {_error: 'unauthorized'};
+            return resp.json();
+        })
+        .then(data => done(data))
+        .catch(err => done({_error: err.toString()}));
+    """
+    result = sb.driver.execute_async_script(script, url, headers)
+    if isinstance(result, dict) and "_error" in result:
+        print(f"[ERROR]   fetch 失败: {result['_error']}")
         return None
-
-    async def get_server_list(self, session):
-        return await self.api_request(session, "?page=1")
-
-    async def get_server_info(self, session, server_uuid, server_type="notfree"):
-        ep = f"/freeservers/{server_uuid}/info" if server_type == "free" else f"/notfreeservers/{server_uuid}/info"
-        return await self.api_request(session, ep)
+    return result
 
 
-async def check_cookie_valid_async(cookie_str):
-    cn, cv = parse_weirdhost_cookie(cookie_str)
-    if not cn or not cv:
-        return False
-    connector = aiohttp.TCPConnector()
+def get_xsrf_token_from_cookies(sb):
     try:
-        async with aiohttp.ClientSession(connector=connector) as session:
-            session.cookie_jar.update_cookies({cn: cv})
-            headers = {"User-Agent": "Mozilla/5.0", "Accept": "text/html"}
-            async with session.get(f"https://{DOMAIN}/", headers=headers) as resp:
-                if resp.status != 200:
-                    return False
-            api_headers = {
-                "Accept": "application/json",
-                "User-Agent": "Mozilla/5.0",
-                "X-Requested-With": "XMLHttpRequest",
-                "Referer": f"https://{DOMAIN}/",
-            }
-            for c in session.cookie_jar:
-                if c.key == "XSRF-TOKEN":
-                    api_headers["X-XSRF-TOKEN"] = unquote(c.value)
-            async with session.get(f"{API_BASE_URL}?page=1", headers=api_headers) as resp:
-                if resp.status == 200:
-                    return "data" in (await resp.json())
-                return False
+        cookies = sb.get_cookies()
+        for c in cookies:
+            if c.get("name") == "XSRF-TOKEN":
+                return unquote(c.get("value", ""))
+    except:
+        pass
+    return None
+
+
+# ============================================================
+#  Turnstile 处理
+# ============================================================
+
+def ts_exists(sb):
+    try:
+        return sb.execute_script("""
+            return !!(
+                document.querySelector('input[name="cf-turnstile-response"]') ||
+                document.querySelector('.cf-turnstile') ||
+                document.querySelector('iframe[src*="challenges.cloudflare.com"]')
+            );
+        """)
     except:
         return False
 
 
-def check_cookie_valid(cookie_str):
-    return asyncio.run(check_cookie_valid_async(cookie_str))
+def ts_solved(sb):
+    try:
+        return sb.execute_script("""
+            var i = document.querySelector('input[name="cf-turnstile-response"]');
+            return i && i.value && i.value.length > 20;
+        """)
+    except:
+        return False
 
 
-async def get_account_info_via_api_async(cookie_str):
-    api = WeirdHostAPI(cookie_str)
-    connector = aiohttp.TCPConnector()
-    async with aiohttp.ClientSession(connector=connector) as session:
-        if not await api.init_session(session):
-            return None
+def expand_turnstile(sb):
+    try:
+        sb.execute_script("""
+            (function() {
+                var ti = document.querySelector('input[name="cf-turnstile-response"]');
+                if (!ti) return;
+                var el = ti;
+                for (var i = 0; i < 20; i++) {
+                    el = el.parentElement;
+                    if (!el) break;
+                    var s = window.getComputedStyle(el);
+                    if (s.overflow === 'hidden') el.style.overflow = 'visible';
+                    el.style.minWidth = 'max-content';
+                }
+                document.querySelectorAll('.cf-turnstile').forEach(function(c) {
+                    c.style.overflow = 'visible';
+                    c.style.width = '300px';
+                    c.style.height = '65px';
+                });
+                document.querySelectorAll('iframe').forEach(function(f) {
+                    if (f.src && f.src.includes('challenges.cloudflare.com')) {
+                        f.style.width = '300px';
+                        f.style.height = '65px';
+                        f.style.visibility = 'visible';
+                        f.style.opacity = '1';
+                    }
+                });
+            })();
+        """)
+    except:
+        pass
 
-        email = await api.get_account_email(session)
 
-        server_list = await api.get_server_list(session)
-        if not server_list or server_list.get("error"):
-            return {"email": email, "servers": []}
-
-        servers = []
-        for s in server_list.get("data", []):
-            attrs = s.get("attributes", {})
-            stype = attrs.get("server_type", "")
-            info = {
-                "identifier": attrs.get("identifier", ""),
-                "uuid": attrs.get("uuid", ""),
-                "name": attrs.get("name", ""),
-                "server_type": stype,
-                "expire": "Unknown",
-                "add_hours": "Unknown",
+def focus_turnstile_area(sb):
+    try:
+        sb.execute_script("""
+            const selectors = [
+                '.cf-turnstile',
+                'iframe[src*="challenges.cloudflare"]',
+                'input[name="cf-turnstile-response"]',
+                'label.cb-lb',
+                '.cb-lb',
+                'input[type="checkbox"]'
+            ];
+            for (const selector of selectors) {
+                const el = document.querySelector(selector);
+                if (el) {
+                    el.scrollIntoView({block: 'center', inline: 'center'});
+                    return true;
+                }
             }
-            if attrs.get("uuid") and stype in ("notfree", "free"):
-                si = await api.get_server_info(session, attrs["uuid"], stype)
-                if si and si.get("success"):
-                    d = si.get("data", {})
-                    info["expire"] = d.get("expire", "Unknown")
-                    info["add_hours"] = d.get("addHours", "Unknown")
-            servers.append(info)
-
-        return {"email": email, "servers": servers}
+            window.scrollTo(0, Math.max(0, document.body.scrollHeight * 0.45));
+            return false;
+        """)
+        time.sleep(0.5)
+    except:
+        pass
 
 
-def get_account_info_via_api(cookie_str):
-    return asyncio.run(get_account_info_via_api_async(cookie_str))
+def handle_turnstile(sb, timeout=120):
+    if not ts_exists(sb):
+        return True
+    print("[INFO]   检测到 Turnstile，尝试自动解决...")
+    try:
+        sb.uc_gui_handle_captcha()
+        if ts_solved(sb) or not ts_exists(sb):
+            print("[INFO]   自动解决成功 ✅")
+            return True
+    except:
+        pass
 
+    print("[INFO]   自动解决未完成，进入手动处理 ...")
+    start = time.time()
+    last_action = 0
+    while time.time() - start < timeout:
+        if ts_solved(sb):
+            print("[INFO]   Turnstile 令牌已生成 ✅")
+            return True
+        if not ts_exists(sb):
+            print("[INFO]   Turnstile 元素消失，可能已通过")
+            return True
 
-async def get_server_info_via_api_async(cookie_str, server_uuid, server_type="notfree"):
-    api = WeirdHostAPI(cookie_str)
-    connector = aiohttp.TCPConnector()
-    async with aiohttp.ClientSession(connector=connector) as session:
-        if not await api.init_session(session):
-            return None
-        info = await api.get_server_info(session, server_uuid, server_type)
-        if info and info.get("success"):
-            return info.get("data", {})
-        return None
+        expand_turnstile(sb)
+        focus_turnstile_area(sb)
 
+        now = time.time()
+        if now - last_action > 4:
+            clicked = False
+            try:
+                iframes = sb.driver.find_elements("css selector", "iframe")
+                for iframe in iframes:
+                    try:
+                        sb.driver.switch_to.frame(iframe)
+                        for sel in ["input[type='checkbox']", "label.cb-lb", ".cb-lb input"]:
+                            try:
+                                elem = sb.driver.find_element("css selector", sel)
+                                if elem.is_displayed():
+                                    elem.click()
+                                    clicked = True
+                                    print(f"[INFO]   在 iframe 中点击了 {sel}")
+                                    break
+                            except:
+                                pass
+                        if clicked:
+                            break
+                    except:
+                        pass
+                    finally:
+                        sb.driver.switch_to.default_content()
+            except Exception as e:
+                print(f"[WARN]   iframe 点击异常: {e}")
+            finally:
+                try:
+                    sb.driver.switch_to.default_content()
+                except:
+                    pass
 
-def get_server_info_via_api(cookie_str, server_uuid, server_type="notfree"):
-    return asyncio.run(get_server_info_via_api_async(cookie_str, server_uuid, server_type))
+            if not clicked:
+                try:
+                    sb.uc_gui_click_captcha()
+                    print("[INFO]   已调用 uc_gui_click_captcha（备用）")
+                except:
+                    pass
+            last_action = now
+
+        time.sleep(2)
+
+    print("[ERROR]  Turnstile 手动处理超时 ❌")
+    return False
 
 
 # ============================================================
@@ -530,300 +569,79 @@ def is_logged_in(sb):
         return False
 
 
-EXPAND_POPUP_JS = """
-(function() {
-    var turnstileInput = document.querySelector('input[name="cf-turnstile-response"]');
-    if (!turnstileInput) return 'no turnstile input';
-    var el = turnstileInput;
-    for (var i = 0; i < 20; i++) {
-        el = el.parentElement;
-        if (!el) break;
-        var style = window.getComputedStyle(el);
-        if (style.overflow === 'hidden' || style.overflowX === 'hidden' || style.overflowY === 'hidden') {
-            el.style.overflow = 'visible';
-        }
-        el.style.minWidth = 'max-content';
-    }
-    var turnstileContainers = document.querySelectorAll('[class*="sc-fKFyDc"], [class*="nwOmR"]');
-    turnstileContainers.forEach(function(container) {
-        container.style.overflow = 'visible';
-        container.style.width = '300px';
-        container.style.minWidth = '300px';
-        container.style.height = '65px';
-    });
-    var iframes = document.querySelectorAll('iframe');
-    iframes.forEach(function(iframe) {
-        if (iframe.src && iframe.src.includes('challenges.cloudflare.com')) {
-            iframe.style.width = '300px';
-            iframe.style.height = '65px';
-            iframe.style.minWidth = '300px';
-            iframe.style.visibility = 'visible';
-            iframe.style.opacity = '1';
-        }
-    });
-    return 'done';
-})();
-"""
-
-
-def check_turnstile_exists(sb):
-    try:
-        return sb.execute_script(
-            "return document.querySelector('input[name=\"cf-turnstile-response\"]') !== null;"
-        )
-    except:
-        return False
-
-
-def check_turnstile_solved(sb):
-    try:
-        return sb.execute_script("""
-            var input = document.querySelector('input[name="cf-turnstile-response"]');
-            return input && input.value && input.value.length > 20;
-        """)
-    except:
-        return False
-
-
-def get_turnstile_checkbox_coords(sb):
-    try:
-        return sb.execute_script("""
-            var iframes = document.querySelectorAll('iframe');
-            for (var i = 0; i < iframes.length; i++) {
-                var src = iframes[i].src || '';
-                if (src.includes('cloudflare') || src.includes('turnstile')) {
-                    var rect = iframes[i].getBoundingClientRect();
-                    if (rect.width > 0 && rect.height > 0) {
-                        return {x:rect.x, y:rect.y, width:rect.width, height:rect.height,
-                                click_x:Math.round(rect.x+30), click_y:Math.round(rect.y+rect.height/2)};
-                    }
-                }
-            }
-            var input = document.querySelector('input[name="cf-turnstile-response"]');
-            if (input) {
-                var container = input.parentElement;
-                for (var j = 0; j < 5; j++) {
-                    if (!container) break;
-                    var rect = container.getBoundingClientRect();
-                    if (rect.width > 100 && rect.height > 30) {
-                        return {x:rect.x, y:rect.y, width:rect.width, height:rect.height,
-                                click_x:Math.round(rect.x+30), click_y:Math.round(rect.y+rect.height/2)};
-                    }
-                    container = container.parentElement;
-                }
-            }
-            return null;
-        """)
-    except:
-        return None
-
-
-def activate_browser_window():
-    try:
-        result = subprocess.run(
-            ["xdotool", "search", "--onlyvisible", "--class", "chrome"],
-            capture_output=True, text=True, timeout=3
-        )
-        window_ids = result.stdout.strip().split('\n')
-        if window_ids and window_ids[0]:
-            subprocess.run(
-                ["xdotool", "windowactivate", window_ids[0]],
-                timeout=2, stderr=subprocess.DEVNULL
-            )
-            time.sleep(0.2)
-            return True
-    except:
-        pass
-    return False
-
-
-def xdotool_click(x, y):
-    x, y = int(x), int(y)
-    activate_browser_window()
-    try:
-        subprocess.run(["xdotool", "mousemove", str(x), str(y)], timeout=2, stderr=subprocess.DEVNULL)
-        time.sleep(0.15)
-        subprocess.run(["xdotool", "click", "1"], timeout=2, stderr=subprocess.DEVNULL)
-        return True
-    except:
-        pass
-    try:
-        os.system(f"xdotool mousemove {x} {y} click 1 2>/dev/null")
-        return True
-    except:
-        return False
-
-
-def click_turnstile_checkbox(sb):
-    coords = get_turnstile_checkbox_coords(sb)
-    if not coords:
-        print("[WARN] 无法获取 Turnstile 坐标")
-        return False
-
-    try:
-        window_info = sb.execute_script("""
-            return {screenX:window.screenX||0, screenY:window.screenY||0,
-                    outerHeight:window.outerHeight, innerHeight:window.innerHeight};
-        """)
-        chrome_bar_height = window_info["outerHeight"] - window_info["innerHeight"]
-        abs_x = coords["click_x"] + window_info["screenX"]
-        abs_y = coords["click_y"] + window_info["screenY"] + chrome_bar_height
-        return xdotool_click(abs_x, abs_y)
-    except Exception as e:
-        print(f"[ERROR] 坐标计算失败: {e}")
-        return False
-
-
-def check_result_popup(sb):
-    try:
-        return sb.execute_script("""
-            var buttons = document.querySelectorAll('button');
-            var hasNextBtn = false;
-            for (var i = 0; i < buttons.length; i++) {
-                if (buttons[i].innerText.includes('NEXT') || buttons[i].innerText.includes('Next')) {
-                    hasNextBtn = true; break;
-                }
-            }
-            var bodyText = document.body.innerText || '';
-            var hasSuccessTitle = bodyText.includes('Success');
-            var hasSuccessContent = bodyText.includes('성공') || bodyText.includes('갱신') || bodyText.includes('연장');
-            var hasCooldown = bodyText.includes('아직') || bodyText.includes('Error');
-            if (hasNextBtn || hasSuccessTitle) {
-                if (hasCooldown && bodyText.includes('아직')) return 'cooldown';
-                if (hasSuccessTitle && hasSuccessContent) return 'success';
-                if (hasNextBtn) {
-                    if (hasCooldown) return 'cooldown';
-                    if (hasSuccessContent) return 'success';
-                }
-            }
-            return null;
-        """)
-    except:
-        return None
-
-
-def check_popup_still_open(sb):
-    try:
-        return sb.execute_script("""
-            var t = document.querySelector('input[name="cf-turnstile-response"]');
-            if (!t) return false;
-            var buttons = document.querySelectorAll('button');
-            for (var i = 0; i < buttons.length; i++) {
-                var text = buttons[i].innerText || '';
-                if ((text.includes('시간추가') || text.includes('시간 추가') || text.includes('연장하기'))
-                    && !text.includes('DELETE')) {
-                    var rect = buttons[i].getBoundingClientRect();
-                    if (rect.x > 200 && rect.width > 0) return true;
-                }
-            }
-            return false;
-        """)
-    except:
-        return False
-
-
-def click_next_button(sb):
-    try:
-        for sel in [
-            "//button[contains(text(), 'NEXT')]",
-            "//button[contains(text(), 'Next')]",
-            "//button//span[contains(text(), 'NEXT')]",
-        ]:
-            if sb.is_element_visible(sel):
-                sb.click(sel)
-                print("[INFO] 已点击 NEXT 按钮")
-                return True
-    except:
-        pass
-    return False
-
-
 def handle_renewal_popup(sb, screenshot_prefix="", timeout=90):
     screenshot_name = f"{screenshot_prefix}_popup.png" if screenshot_prefix else "popup_fixed.png"
 
-    print("[INFO]   [阶段1] 等待弹窗和 Turnstile...")
-
-    turnstile_ready = False
-    for _ in range(20):
-        result = check_result_popup(sb)
-        if result == "cooldown":
-            print("[INFO]   检测到冷却期弹窗")
-            sb.save_screenshot(screenshot_name)
-            return {"status": "cooldown", "screenshot": screenshot_name}
-        if result == "success":
-            print("[INFO]   检测到成功弹窗")
-            sb.save_screenshot(screenshot_name)
-            return {"status": "success", "screenshot": screenshot_name}
-        if check_turnstile_exists(sb):
-            turnstile_ready = True
-            print("[INFO]   检测到 Turnstile")
-            break
-        time.sleep(1)
-
-    if not turnstile_ready:
-        print("[WARN]   未检测到 Turnstile")
-        sb.save_screenshot(screenshot_name)
-        return {"status": "error", "message": "未检测到 Turnstile", "screenshot": screenshot_name}
-
-    print("[INFO]   [阶段2] 修复弹窗样式...")
-    for _ in range(3):
-        sb.execute_script(EXPAND_POPUP_JS)
-        time.sleep(0.5)
-    sb.save_screenshot(screenshot_name)
-
-    print("[INFO]   [阶段3] 点击 Turnstile...")
-    for attempt in range(6):
-        if check_turnstile_solved(sb):
-            print("[INFO]   Turnstile 已通过!")
-            break
-        sb.execute_script(EXPAND_POPUP_JS)
-        time.sleep(0.3)
-        click_turnstile_checkbox(sb)
-        for _ in range(8):
-            time.sleep(0.5)
-            if check_turnstile_solved(sb):
-                print("[INFO]   Turnstile 已通过!")
-                break
-        if check_turnstile_solved(sb):
-            break
-        sb.save_screenshot(
-            f"{screenshot_prefix}_turnstile_{attempt}.png" if screenshot_prefix
-            else f"turnstile_attempt_{attempt}.png"
-        )
-
-    print("[INFO]   等待提交结果...")
-    result_start = time.time()
-    last_screenshot_time = 0
-
-    while time.time() - result_start < 45:
-        result = check_result_popup(sb)
-        if result == "success":
-            print("[INFO]   续期成功!")
-            sb.save_screenshot(screenshot_name)
-            time.sleep(1)
-            click_next_button(sb)
-            return {"status": "success", "screenshot": screenshot_name}
-        if result == "cooldown":
-            print("[INFO]   冷却期内")
-            sb.save_screenshot(screenshot_name)
-            time.sleep(1)
-            click_next_button(sb)
-            return {"status": "cooldown", "screenshot": screenshot_name}
-        if not check_popup_still_open(sb):
-            time.sleep(2)
-            result = check_result_popup(sb)
-            if result:
+    print("[INFO]   [阶段1] 等待弹窗出现...")
+    for _ in range(30):
+        try:
+            body_text = sb.execute_script("return document.body.innerText || ''")
+            if "성공" in body_text and ("갱신" in body_text or "연장" in body_text):
+                print("[INFO]   检测到成功弹窗")
                 sb.save_screenshot(screenshot_name)
-                if result == "success":
-                    click_next_button(sb)
-                    return {"status": "success", "screenshot": screenshot_name}
-                elif result == "cooldown":
-                    click_next_button(sb)
-                    return {"status": "cooldown", "screenshot": screenshot_name}
-        if time.time() - last_screenshot_time > 5:
-            sb.save_screenshot(screenshot_name)
-            last_screenshot_time = time.time()
+                return {"status": "success", "screenshot": screenshot_name}
+            if "아직" in body_text and "Error" not in body_text:
+                print("[INFO]   检测到冷却期提示")
+                sb.save_screenshot(screenshot_name)
+                return {"status": "cooldown", "screenshot": screenshot_name}
+        except:
+            pass
+
+        if ts_exists(sb):
+            print("[INFO]   检测到 Turnstile，开始处理")
+            break
         time.sleep(1)
+
+    if not ts_exists(sb):
+        print("[WARN]   未检测到 Turnstile，可能无需验证")
+        time.sleep(5)
+        try:
+            body_text = sb.execute_script("return document.body.innerText || ''")
+            if "성공" in body_text:
+                sb.save_screenshot(screenshot_name)
+                return {"status": "success", "screenshot": screenshot_name}
+            if "아직" in body_text:
+                sb.save_screenshot(screenshot_name)
+                return {"status": "cooldown", "screenshot": screenshot_name}
+        except:
+            pass
+        sb.save_screenshot(screenshot_name)
+        return {"status": "error", "message": "未检测到 Turnstile 且没有结果弹窗", "screenshot": screenshot_name}
+
+    if not handle_turnstile(sb, timeout=60):
+        sb.save_screenshot(screenshot_name)
+        return {"status": "error", "message": "Turnstile 验证失败", "screenshot": screenshot_name}
+
+    print("[INFO]   Turnstile 已处理，等待续期结果...")
+    result_start = time.time()
+    while time.time() - result_start < 45:
+        try:
+            body_text = sb.execute_script("return document.body.innerText || ''")
+            if "성공" in body_text and ("갱신" in body_text or "연장" in body_text):
+                print("[INFO]   续期成功!")
+                sb.save_screenshot(screenshot_name)
+                try:
+                    sb.execute_script("""
+                        var btns = document.querySelectorAll('button');
+                        btns.forEach(b => { if(b.innerText.includes('NEXT') || b.innerText.includes('Next')) b.click(); });
+                    """)
+                except:
+                    pass
+                return {"status": "success", "screenshot": screenshot_name}
+            if "아직" in body_text:
+                print("[INFO]   冷却期内")
+                sb.save_screenshot(screenshot_name)
+                try:
+                    sb.execute_script("""
+                        var btns = document.querySelectorAll('button');
+                        btns.forEach(b => { if(b.innerText.includes('NEXT') || b.innerText.includes('Next')) b.click(); });
+                    """)
+                except:
+                    pass
+                return {"status": "cooldown", "screenshot": screenshot_name}
+        except:
+            pass
+        time.sleep(2)
 
     print("[WARN]   等待结果超时")
     sb.save_screenshot(screenshot_name)
@@ -831,7 +649,6 @@ def handle_renewal_popup(sb, screenshot_prefix="", timeout=90):
 
 
 def check_and_update_cookie(sb, cookie_env, original_cookie_value, remark=""):
-    """检查浏览器 Cookie 变化，变化时更新 GitHub Secret（保持 备注-----cookie 格式）"""
     try:
         cookies = sb.get_cookies()
         for cookie in cookies:
@@ -858,7 +675,7 @@ def check_and_update_cookie(sb, cookie_env, original_cookie_value, remark=""):
 
 
 # ============================================================
-#  单个服务器的续期处理
+#  单个服务器续期处理
 # ============================================================
 
 def process_single_server(sb, server_info, cookie_name, cookie_value, cookie_str,
@@ -886,7 +703,6 @@ def process_single_server(sb, server_info, cookie_name, cookie_value, cookie_str
     rd = get_remaining_days(api_expiry)
     dd = format_remaining_days(rd)
 
-    # 日志中隐藏服务器ID
     print(f"\n  {'─' * 50}")
     print(f"  [INFO] 服务器: {mask_server_id(server_id)} [{server_type}] {server_name}")
     print(f"  [INFO] 到期: {api_expiry} | 剩余: {calculate_remaining_time(api_expiry)} ({dd}天)")
@@ -914,7 +730,6 @@ def process_single_server(sb, server_info, cookie_name, cookie_value, cookie_str
         if page_expiry != "Unknown":
             srv_result["original_expiry"] = page_expiry
 
-        # 检查续期按钮
         print(f"  [INFO] 检查续期按钮...")
         btn_found, btn_enabled, btn_xpath, btn_reason = check_renewal_button_enabled(sb)
 
@@ -942,11 +757,18 @@ def process_single_server(sb, server_info, cookie_name, cookie_value, cookie_str
         popup_result = handle_renewal_popup(sb, screenshot_prefix=screenshot_prefix, timeout=90)
         srv_result["screenshot"] = popup_result.get("screenshot")
 
-        # 验证结果
+        # 验证到期时间
         time.sleep(3)
+        xsrf_token = get_xsrf_token_from_cookies(sb)
         if server_uuid:
-            new_info = get_server_info_via_api(cookie_str, server_uuid, server_type)
-            new_expiry = new_info.get("expire", "Unknown") if new_info else srv_result["original_expiry"]
+            ep = f"/freeservers/{server_uuid}/info" if server_type == "free" else f"/notfreeservers/{server_uuid}/info"
+            new_info = api_fetch_json(sb, f"{API_BASE_URL}{ep}", xsrf_token)
+            if new_info and new_info.get("success"):
+                new_expiry = new_info.get("data", {}).get("expire", srv_result["original_expiry"])
+            else:
+                sb.uc_open_with_reconnect(server_url, reconnect_time=3)
+                time.sleep(3)
+                new_expiry = get_expiry_from_page(sb)
         else:
             sb.uc_open_with_reconnect(server_url, reconnect_time=3)
             time.sleep(3)
@@ -995,7 +817,7 @@ def process_single_server(sb, server_info, cookie_name, cookie_value, cookie_str
 
 
 # ============================================================
-#  单个账号的处理
+#  单个账号处理
 # ============================================================
 
 def process_single_account(sb, account, account_index):
@@ -1015,33 +837,88 @@ def process_single_account(sb, account, account_index):
         "cookie_updated": False,
     }
 
+    # 日志中遮盖备注
     print(f"\n{'=' * 60}")
-    print(f"[INFO] 处理账号 [{account_index + 1}]: {remark} ({cookie_env})")
+    print(f"[INFO] 处理账号 [{account_index + 1}]: {mask_remark(remark)} ({cookie_env})")
     print(f"{'=' * 60}")
 
-    # Step 1: Cookie 有效性
-    print(f"[INFO] [步骤1] 检查 Cookie 有效性...")
-    if not check_cookie_valid(cookie_str):
-        print(f"[ERROR] Cookie 已失效")
-        result["status"] = "cookie_invalid"
-        result["message"] = "Cookie 失效，请重新获取"
-        return result
-    print(f"[INFO] ✅ Cookie 有效")
-
-    # Step 2: API 获取信息
-    print(f"[INFO] [步骤2] API 获取账号信息...")
-    account_info = get_account_info_via_api(cookie_str)
-    if not account_info:
-        print(f"[ERROR] API 调用失败")
+    # Step 1: Turnstile
+    print(f"[INFO] [步骤1] 访问站点并处理 Cloudflare 验证...")
+    sb.uc_open_with_reconnect(f"https://{DOMAIN}/", reconnect_time=5)
+    if not handle_turnstile(sb):
+        print(f"[ERROR] Turnstile 验证失败")
         result["status"] = "error"
-        result["message"] = "API 调用失败"
+        result["message"] = "Cloudflare Turnstile 验证失败"
+        return result
+    print(f"[INFO] ✅ CF 验证通过")
+
+    # Step 2: 注入 Cookie 并登录
+    print(f"[INFO] [步骤2] 注入 Cookie 并登录...")
+    sb.add_cookie({"name": cookie_name, "value": cookie_value, "domain": DOMAIN, "path": "/"})
+    sb.uc_open_with_reconnect(f"https://{DOMAIN}/", reconnect_time=5)
+    time.sleep(3)
+
+    if not is_logged_in(sb):
+        print("[WARN]   未检测到登录状态，尝试刷新...")
+        sb.uc_open_with_reconnect(f"https://{DOMAIN}/server/", reconnect_time=5)
+        time.sleep(3)
+
+    if not is_logged_in(sb):
+        ss_path = f"acc{account_index+1}_login_fail.png"
+        sb.save_screenshot(ss_path)
+        result["status"] = "cookie_invalid"
+        result["message"] = "Cookie 失效或登录失败（Turnstile 通过后仍无法登录）"
         return result
 
-    email = account_info.get("email", "Unknown")
-    servers = account_info.get("servers", [])
-    result["email"] = email
+    xsrf_token = get_xsrf_token_from_cookies(sb)
+    print(f"[INFO]   登录成功，已获取会话 Cookie")
 
-    # 日志中隐藏邮箱
+    # Step 3: 获取信息
+    print(f"[INFO] [步骤3] 获取账号信息...")
+    server_data = api_fetch_json(sb, f"{API_BASE_URL}?page=1", xsrf_token)
+    if not server_data or server_data.get("error") == "unauthorized":
+        print(f"[ERROR]   获取服务器列表失败")
+        result["status"] = "error"
+        result["message"] = "无法获取服务器列表"
+        return result
+
+    email_data = api_fetch_json(sb,
+        f"{API_BASE_URL}/account/activity?sort=-timestamp&page=1&include[]=actor",
+        xsrf_token
+    )
+    email = None
+    if email_data:
+        for item in email_data.get("data", []):
+            actor = item.get("attributes", {}).get("relationships", {}).get("actor", {})
+            if actor.get("object") == "user":
+                email = actor.get("attributes", {}).get("email")
+                if email:
+                    break
+    result["email"] = email or "Unknown"
+
+    servers = []
+    for s in server_data.get("data", []):
+        attrs = s.get("attributes", {})
+        stype = attrs.get("server_type", "")
+        info = {
+            "identifier": attrs.get("identifier", ""),
+            "uuid": attrs.get("uuid", ""),
+            "name": attrs.get("name", ""),
+            "server_type": stype,
+            "expire": "Unknown",
+            "add_hours": "Unknown",
+        }
+        if attrs.get("uuid") and stype in ("notfree", "free"):
+            ep = f"/freeservers/{attrs['uuid']}/info" if stype == "free" else f"/notfreeservers/{attrs['uuid']}/info"
+            si = api_fetch_json(sb, f"{API_BASE_URL}{ep}", xsrf_token)
+            if si and si.get("success"):
+                d = si.get("data", {})
+                info["expire"] = d.get("expire", "Unknown")
+                info["add_hours"] = d.get("addHours", "Unknown")
+        servers.append(info)
+
+    result["servers"] = servers
+
     if email and email != "Unknown":
         print(f"[INFO] 邮箱: {mask_email(email)}")
 
@@ -1051,53 +928,28 @@ def process_single_account(sb, account, account_index):
         result["message"] = "该账号下没有服务器"
         return result
 
-    # 日志中隐藏服务器ID
     print(f"[INFO] 找到 {len(servers)} 个服务器:")
     for s in servers:
-        sid = s.get("identifier", "?")
-        stype = s.get("server_type", "?")
-        sname = s.get("name", "")
-        sexpire = s.get("expire", "Unknown")
-        print(f"  - {mask_server_id(sid)} [{stype}] {sname} | 到期: {sexpire}")
+        print(f"  - {mask_server_id(s['identifier'])} [{s['server_type']}] {s['name']} | 到期: {s['expire']}")
 
-    # Step 3: 设置 Cookie
-    print(f"[INFO] [步骤3] 设置浏览器 Cookie...")
-    try:
-        sb.uc_open_with_reconnect(f"https://{DOMAIN}", reconnect_time=3)
-        time.sleep(1)
-        sb.delete_all_cookies()
-    except:
-        pass
-    sb.uc_open_with_reconnect(f"https://{DOMAIN}", reconnect_time=3)
-    time.sleep(2)
-    sb.add_cookie({"name": cookie_name, "value": cookie_value, "domain": DOMAIN, "path": "/"})
-    print(f"[INFO] Cookie 已设置")
-
-    # Step 4: 逐个服务器
+    # Step 4: 逐个处理服务器
     print(f"[INFO] [步骤4] 逐个处理服务器续期...")
     server_results = []
-
     for srv_idx, server in enumerate(servers):
         ss_prefix = f"acc{account_index + 1}_srv{srv_idx + 1}"
         srv_result = process_single_server(
             sb, server, cookie_name, cookie_value, cookie_str, cookie_env, remark, ss_prefix
         )
         server_results.append(srv_result)
-
         if srv_result.get("cookie_updated"):
             result["cookie_updated"] = True
-
         if srv_idx < len(servers) - 1:
-            if srv_result.get("status") == "skipped":
-                wait = random.randint(2, 4)
-            else:
-                wait = random.randint(5, 10)
+            wait = random.randint(2, 4) if srv_result.get("status") == "skipped" else random.randint(5, 10)
             print(f"\n  [INFO] 等待 {wait} 秒后处理下一个服务器...")
             time.sleep(wait)
 
     result["servers"] = server_results
 
-    # 汇总
     statuses = [s["status"] for s in server_results]
     if "success" in statuses:
         result["status"] = "success"
@@ -1119,116 +971,77 @@ def process_single_account(sb, account, account_index):
 
 
 # ============================================================
-#  TG 汇总报告（私人通知，显示完整信息）
+#  单账号 TG 通知（新格式，完整信息，去除了名称行）
 # ============================================================
 
-def send_summary_report(results):
-    total_accounts = len(results)
-    total_servers = sum(len(r.get("servers", [])) for r in results)
-    success_servers = sum(
-        sum(1 for s in r.get("servers", []) if s["status"] == "success") for r in results
-    )
-    skipped_servers = sum(
-        sum(1 for s in r.get("servers", []) if s["status"] == "skipped") for r in results
-    )
-    failed_servers = sum(
-        sum(1 for s in r.get("servers", []) if s["status"] in ["error", "timeout", "cooldown"])
-        for r in results
-    )
+def send_account_notification(result):
+    email = result.get("email", "Unknown")
+    remark = result.get("remark", "")
+    cookie_updated = result.get("cookie_updated", False)
+    servers = result.get("servers", [])
+    status = result.get("status", "unknown")
 
-    lines = [
-        f"🔔 <b>Weirdhost 续期报告</b>",
-        f"",
-        f"👤 账号: {total_accounts}  |  🖥 服务器: {total_servers}",
-        f"✅ {success_servers}  ⏭️ {skipped_servers}  ❌ {failed_servers}",
-    ]
+    account_display = email if email and email != "Unknown" else remark
+    lines = [f"账号：{account_display}"]
 
-    for i, r in enumerate(results):
-        remark = r.get("remark", f"账号{i+1}")
-        email = r.get("email", "Unknown")
-        cookie_env = r.get("cookie_env", "")
-        cookie_updated = r.get("cookie_updated", False)
-        server_list = r.get("servers", [])
+    if status == "cookie_invalid":
+        lines.append("状态：⚠️ Cookie 已失效，请及时更新 WEIRDHOST_COOKIE_*")
+        screenshot = None
+    elif status == "no_server":
+        lines.append("状态：⚠️ 没有服务器")
+        screenshot = None
+    else:
+        for s in servers:
+            lines.append("")  # 空行分隔
+            lines.append(f"服务器：{s.get('server_id', '')}")
+            srv_status = s["status"]
 
-        acct_icon = {
-            "success": "✅", "cooldown": "⏳", "skipped": "⏭️",
-            "error": "❌", "timeout": "⚠️", "cookie_invalid": "🔒",
-            "no_server": "📭",
-        }.get(r["status"], "❓")
-
-        # TG 通知：显示完整邮箱（私人）
-        lines.append(f"")
-        lines.append(f"━━━━━━━━━━━━━━━━━━━━")
-        acct_title = f"{acct_icon} <b>{remark}</b>"
-        if email and email != "Unknown":
-            acct_title += f"  ({email})"
-        lines.append(acct_title)
-
-        if not server_list:
-            lines.append(f"  ⚠️ {r.get('message', '未知错误')}")
-            if cookie_updated:
-                lines.append(f"  🔑 Cookie 已自动更新")
-            continue
-
-        for s in server_list:
-            # TG 通知：显示完整服务器ID（私人）
-            sid = s.get("server_id", "?")
-            stype = s.get("server_type", "?")
-            sname = s.get("server_name", "")
-            status = s["status"]
-
-            srv_icon = {
-                "success": "✅", "cooldown": "⏳", "skipped": "⏭️",
-                "error": "❌", "timeout": "⚠️",
-            }.get(status, "❓")
-
-            type_label = "💰" if stype == "notfree" else "🆓" if stype == "free" else "❓"
-
-            lines.append(f"")
-            lines.append(f"  {srv_icon} {type_label} <code>{sid}</code>")
-            if sname:
-                lines.append(f"      {sname}")
-
-            if status == "success":
+            if srv_status == "success":
+                lines.append("状态：🟢 续期成功")
                 new_exp = s.get("new_expiry", "Unknown")
-                lines.append(f"      📅 {new_exp}")
-                lines.append(f"      ⏳ 剩余 {calculate_remaining_time(new_exp)}")
+                lines.append(f"剩余：{calculate_remaining_time(new_exp)}")
+                # 延长时长
                 msg = s.get("message", "")
-                if msg:
-                    lines.append(f"      📝 {msg}")
-
-            elif status == "skipped":
-                expiry = s.get("original_expiry", s.get("new_expiry", "Unknown"))
-                lines.append(f"      📅 {expiry}")
-                lines.append(f"      ⏳ 剩余 {calculate_remaining_time(expiry)}")
-                msg = s.get("message", "")
-                if msg:
-                    lines.append(f"      💡 {msg}")
-
-            elif status == "cooldown":
+                if msg and "延长" in msg:
+                    lines.append(f"延长：{msg}")
+                else:
+                    orig = s.get("original_expiry", "Unknown")
+                    new = s.get("new_expiry", "Unknown")
+                    if orig != "Unknown" and new != "Unknown":
+                        odt = parse_expiry_to_datetime(orig)
+                        ndt = parse_expiry_to_datetime(new)
+                        if odt and ndt and ndt > odt:
+                            diff_h = (ndt - odt).total_seconds() / 3600
+                            lines.append(f"延长：延长{diff_h:.1f}h")
+            elif srv_status == "cooldown":
+                lines.append("状态：⏳ 冷却期")
                 expiry = s.get("original_expiry", "Unknown")
-                lines.append(f"      📅 {expiry}")
-                lines.append(f"      ⏳ 剩余 {calculate_remaining_time(expiry)}")
-                lines.append(f"      💡 冷却中")
+                lines.append(f"剩余：{calculate_remaining_time(expiry)}")
+                lines.append("提示：冷却中，请稍后再试")
+            elif srv_status == "skipped":
+                lines.append("状态：⏭️ 跳过")
+                expiry = s.get("original_expiry", s.get("new_expiry", "Unknown"))
+                lines.append(f"剩余：{calculate_remaining_time(expiry)}")
+                lines.append(f"原因：{s.get('message', '未知')}")
+            else:  # error / timeout
+                lines.append(f"状态：❌ {srv_status}")
+                lines.append(f"信息：{s.get('message', '未知')}")
 
-            else:
-                lines.append(f"      ⚠️ {s.get('message', '未知错误')}")
+    if cookie_updated:
+        lines.append("")
+        lines.append("🔑 Cookie 已自动更新")
 
-        if cookie_updated:
-            lines.append(f"  🔑 Cookie 已自动更新")
+    lines.append("")
+    lines.append("Weirdhost Auto Renew")
 
     message = "\n".join(lines)
 
-    # 找截图
     screenshot = None
-    for r in results:
-        for s in r.get("servers", []):
-            if s["status"] in ["success", "cooldown", "error", "timeout"]:
-                if s.get("screenshot") and os.path.exists(s["screenshot"]):
-                    screenshot = s["screenshot"]
-                    break
-        if screenshot:
-            break
+    for s in servers:
+        if s["status"] in ("success", "cooldown", "error", "timeout"):
+            if s.get("screenshot") and os.path.exists(s["screenshot"]):
+                screenshot = s["screenshot"]
+                break
 
     if screenshot:
         sync_tg_notify_photo(screenshot, message)
@@ -1266,8 +1079,6 @@ def add_server_time():
     print("=" * 60)
     print(f"[INFO] Weirdhost 自动续期")
     print(f"[INFO] 共 {len(accounts)} 个账号")
-    print(f"[INFO] 续期策略: 检查续期按钮是否可用")
-    print(f"[INFO] 服务器发现: API 自动查找")
     print("=" * 60)
 
     results = []
@@ -1286,6 +1097,8 @@ def add_server_time():
                 result = process_single_account(sb, account, i)
                 results.append(result)
 
+                send_account_notification(result)
+
                 if i < len(accounts) - 1:
                     if result.get("status") == "skipped":
                         wait_time = random.randint(2, 4)
@@ -1299,13 +1112,11 @@ def add_server_time():
         print(f"\n[ERROR] 浏览器异常: {repr(e)}")
         traceback.print_exc()
 
-        if results:
-            send_summary_report(results)
-        else:
+        if not results:
             sync_tg_notify(f"🔔 <b>Weirdhost</b>\n\n❌ 浏览器启动失败\n\n<code>{repr(e)}</code>")
         return
 
-    # 控制台摘要（隐藏敏感信息）
+    # 控制台摘要
     print(f"\n{'=' * 60}")
     print("[INFO] 全部处理完成")
     print(f"{'=' * 60}")
@@ -1318,10 +1129,10 @@ def add_server_time():
         icon = icons.get(r["status"], "❓")
         srv_count = len(r.get("servers", []))
         email_display = mask_email(r.get("email", ""))
-        print(f"  {icon} {r.get('remark', '?')} ({email_display}) | "
+        # 备注也遮盖
+        remark_display = mask_remark(r.get("remark", "?"))
+        print(f"  {icon} {remark_display} ({email_display}) | "
               f"{srv_count} 个服务器 | {r['status']} | {r.get('message', '')}")
-
-    send_summary_report(results)
 
 
 if __name__ == "__main__":
