@@ -8,6 +8,7 @@ on:
 
 jobs:
   add_time:
+    name: 运行续期脚本
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
