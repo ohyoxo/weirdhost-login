@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# scripts/weirdhost_renew.py
 
 import os
 import sys
@@ -344,7 +343,7 @@ def get_xsrf_token_from_cookies(sb):
 
 
 # ============================================================
-#  Turnstile 处理
+#  Turnstile 处理（登录阶段）
 # ============================================================
 
 def ts_exists(sb):
@@ -502,7 +501,300 @@ def handle_turnstile(sb, timeout=120):
 
 
 # ============================================================
-#  SeleniumBase 页面交互
+#  Turnstile 处理（续期阶段）
+# ============================================================
+
+def check_turnstile_exists_popup(sb):
+    try:
+        return sb.execute_script(
+            "return document.querySelector('input[name=\"cf-turnstile-response\"]') !== null;"
+        )
+    except:
+        return False
+
+def check_turnstile_solved_popup(sb):
+    try:
+        return sb.execute_script("""
+            var input = document.querySelector('input[name="cf-turnstile-response"]');
+            return input && input.value && input.value.length > 20;
+        """)
+    except:
+        return False
+
+EXPAND_POPUP_JS = """
+(function() {
+    var turnstileInput = document.querySelector('input[name="cf-turnstile-response"]');
+    if (!turnstileInput) return 'no turnstile input';
+    var el = turnstileInput;
+    for (var i = 0; i < 20; i++) {
+        el = el.parentElement;
+        if (!el) break;
+        var style = window.getComputedStyle(el);
+        if (style.overflow === 'hidden' || style.overflowX === 'hidden' || style.overflowY === 'hidden') {
+            el.style.overflow = 'visible';
+        }
+        el.style.minWidth = 'max-content';
+    }
+    var turnstileContainers = document.querySelectorAll('[class*="sc-fKFyDc"], [class*="nwOmR"]');
+    turnstileContainers.forEach(function(container) {
+        container.style.overflow = 'visible';
+        container.style.width = '300px';
+        container.style.minWidth = '300px';
+        container.style.height = '65px';
+    });
+    var iframes = document.querySelectorAll('iframe');
+    iframes.forEach(function(iframe) {
+        if (iframe.src && iframe.src.includes('challenges.cloudflare.com')) {
+            iframe.style.width = '300px';
+            iframe.style.height = '65px';
+            iframe.style.minWidth = '300px';
+            iframe.style.visibility = 'visible';
+            iframe.style.opacity = '1';
+        }
+    });
+    return 'done';
+})();
+"""
+
+def get_turnstile_checkbox_coords(sb):
+    try:
+        return sb.execute_script("""
+            var iframes = document.querySelectorAll('iframe');
+            for (var i = 0; i < iframes.length; i++) {
+                var src = iframes[i].src || '';
+                if (src.includes('cloudflare') || src.includes('turnstile')) {
+                    var rect = iframes[i].getBoundingClientRect();
+                    if (rect.width > 0 && rect.height > 0) {
+                        return {x:rect.x, y:rect.y, width:rect.width, height:rect.height,
+                                click_x:Math.round(rect.x+30), click_y:Math.round(rect.y+rect.height/2)};
+                    }
+                }
+            }
+            var input = document.querySelector('input[name="cf-turnstile-response"]');
+            if (input) {
+                var container = input.parentElement;
+                for (var j = 0; j < 5; j++) {
+                    if (!container) break;
+                    var rect = container.getBoundingClientRect();
+                    if (rect.width > 100 && rect.height > 30) {
+                        return {x:rect.x, y:rect.y, width:rect.width, height:rect.height,
+                                click_x:Math.round(rect.x+30), click_y:Math.round(rect.y+rect.height/2)};
+                    }
+                    container = container.parentElement;
+                }
+            }
+            return null;
+        """)
+    except:
+        return None
+
+def activate_browser_window():
+    try:
+        result = subprocess.run(
+            ["xdotool", "search", "--onlyvisible", "--class", "chrome"],
+            capture_output=True, text=True, timeout=3
+        )
+        window_ids = result.stdout.strip().split('\n')
+        if window_ids and window_ids[0]:
+            subprocess.run(
+                ["xdotool", "windowactivate", window_ids[0]],
+                timeout=2, stderr=subprocess.DEVNULL
+            )
+            time.sleep(0.2)
+            return True
+    except:
+        pass
+    return False
+
+def xdotool_click(x, y):
+    x, y = int(x), int(y)
+    activate_browser_window()
+    try:
+        subprocess.run(["xdotool", "mousemove", str(x), str(y)], timeout=2, stderr=subprocess.DEVNULL)
+        time.sleep(0.15)
+        subprocess.run(["xdotool", "click", "1"], timeout=2, stderr=subprocess.DEVNULL)
+        return True
+    except:
+        pass
+    try:
+        os.system(f"xdotool mousemove {x} {y} click 1 2>/dev/null")
+        return True
+    except:
+        return False
+
+def click_turnstile_checkbox(sb):
+    coords = get_turnstile_checkbox_coords(sb)
+    if not coords:
+        print("[WARN] 无法获取 Turnstile 坐标")
+        return False
+    try:
+        window_info = sb.execute_script("""
+            return {screenX:window.screenX||0, screenY:window.screenY||0,
+                    outerHeight:window.outerHeight, innerHeight:window.innerHeight};
+        """)
+        chrome_bar_height = window_info["outerHeight"] - window_info["innerHeight"]
+        abs_x = coords["click_x"] + window_info["screenX"]
+        abs_y = coords["click_y"] + window_info["screenY"] + chrome_bar_height
+        return xdotool_click(abs_x, abs_y)
+    except Exception as e:
+        print(f"[ERROR] 坐标计算失败: {e}")
+        return False
+
+def check_result_popup(sb):
+    try:
+        return sb.execute_script("""
+            var buttons = document.querySelectorAll('button');
+            var hasNextBtn = false;
+            for (var i = 0; i < buttons.length; i++) {
+                if (buttons[i].innerText.includes('NEXT') || buttons[i].innerText.includes('Next')) {
+                    hasNextBtn = true; break;
+                }
+            }
+            var bodyText = document.body.innerText || '';
+            var hasSuccessTitle = bodyText.includes('Success');
+            var hasSuccessContent = bodyText.includes('성공') || bodyText.includes('갱신') || bodyText.includes('연장');
+            var hasCooldown = bodyText.includes('아직') || bodyText.includes('Error');
+            if (hasNextBtn || hasSuccessTitle) {
+                if (hasCooldown && bodyText.includes('아직')) return 'cooldown';
+                if (hasSuccessTitle && hasSuccessContent) return 'success';
+                if (hasNextBtn) {
+                    if (hasCooldown) return 'cooldown';
+                    if (hasSuccessContent) return 'success';
+                }
+            }
+            return null;
+        """)
+    except:
+        return None
+
+def check_popup_still_open(sb):
+    try:
+        return sb.execute_script("""
+            var t = document.querySelector('input[name="cf-turnstile-response"]');
+            if (!t) return false;
+            var buttons = document.querySelectorAll('button');
+            for (var i = 0; i < buttons.length; i++) {
+                var text = buttons[i].innerText || '';
+                if ((text.includes('시간추가') || text.includes('시간 추가') || text.includes('연장하기'))
+                    && !text.includes('DELETE')) {
+                    var rect = buttons[i].getBoundingClientRect();
+                    if (rect.x > 200 && rect.width > 0) return true;
+                }
+            }
+            return false;
+        """)
+    except:
+        return False
+
+def click_next_button(sb):
+    try:
+        for sel in [
+            "//button[contains(text(), 'NEXT')]",
+            "//button[contains(text(), 'Next')]",
+            "//button//span[contains(text(), 'NEXT')]",
+        ]:
+            if sb.is_element_visible(sel):
+                sb.click(sel)
+                print("[INFO] 已点击 NEXT 按钮")
+                return True
+    except:
+        pass
+    return False
+
+def handle_renewal_popup(sb, screenshot_prefix="", timeout=90):
+    screenshot_name = f"{screenshot_prefix}_popup.png" if screenshot_prefix else "popup_fixed.png"
+
+    print("[INFO]   [阶段1] 等待弹窗和 Turnstile...")
+
+    turnstile_ready = False
+    for _ in range(20):
+        result = check_result_popup(sb)
+        if result == "cooldown":
+            print("[INFO]   检测到冷却期弹窗")
+            sb.save_screenshot(screenshot_name)
+            return {"status": "cooldown", "screenshot": screenshot_name}
+        if result == "success":
+            print("[INFO]   检测到成功弹窗")
+            sb.save_screenshot(screenshot_name)
+            return {"status": "success", "screenshot": screenshot_name}
+        if check_turnstile_exists_popup(sb):
+            turnstile_ready = True
+            print("[INFO]   检测到 Turnstile")
+            break
+        time.sleep(1)
+
+    if not turnstile_ready:
+        print("[WARN]   未检测到 Turnstile")
+        sb.save_screenshot(screenshot_name)
+        return {"status": "error", "message": "未检测到 Turnstile", "screenshot": screenshot_name}
+
+    print("[INFO]   [阶段2] 修复弹窗样式...")
+    for _ in range(3):
+        sb.execute_script(EXPAND_POPUP_JS)
+        time.sleep(0.5)
+    sb.save_screenshot(screenshot_name)
+
+    print("[INFO]   [阶段3] 点击 Turnstile...")
+    for attempt in range(6):
+        if check_turnstile_solved_popup(sb):
+            print("[INFO]   Turnstile 已通过!")
+            break
+        sb.execute_script(EXPAND_POPUP_JS)
+        time.sleep(0.3)
+        click_turnstile_checkbox(sb)
+        for _ in range(8):
+            time.sleep(0.5)
+            if check_turnstile_solved_popup(sb):
+                print("[INFO]   Turnstile 已通过!")
+                break
+        if check_turnstile_solved_popup(sb):
+            break
+        sb.save_screenshot(
+            f"{screenshot_prefix}_turnstile_{attempt}.png" if screenshot_prefix
+            else f"turnstile_attempt_{attempt}.png"
+        )
+
+    print("[INFO]   等待提交结果...")
+    result_start = time.time()
+    last_screenshot_time = 0
+
+    while time.time() - result_start < 45:
+        result = check_result_popup(sb)
+        if result == "success":
+            print("[INFO]   续期成功!")
+            sb.save_screenshot(screenshot_name)
+            time.sleep(1)
+            click_next_button(sb)
+            return {"status": "success", "screenshot": screenshot_name}
+        if result == "cooldown":
+            print("[INFO]   冷却期内")
+            sb.save_screenshot(screenshot_name)
+            time.sleep(1)
+            click_next_button(sb)
+            return {"status": "cooldown", "screenshot": screenshot_name}
+        if not check_popup_still_open(sb):
+            time.sleep(2)
+            result = check_result_popup(sb)
+            if result:
+                sb.save_screenshot(screenshot_name)
+                if result == "success":
+                    click_next_button(sb)
+                    return {"status": "success", "screenshot": screenshot_name}
+                elif result == "cooldown":
+                    click_next_button(sb)
+                    return {"status": "cooldown", "screenshot": screenshot_name}
+        if time.time() - last_screenshot_time > 5:
+            sb.save_screenshot(screenshot_name)
+            last_screenshot_time = time.time()
+        time.sleep(1)
+
+    print("[WARN]   等待结果超时")
+    sb.save_screenshot(screenshot_name)
+    return {"status": "timeout", "screenshot": screenshot_name}
+
+
+# ============================================================
+#  SeleniumBase 页面交互（通用）
 # ============================================================
 
 def get_expiry_from_page(sb):
@@ -567,85 +859,6 @@ def is_logged_in(sb):
         return False
     except:
         return False
-
-
-def handle_renewal_popup(sb, screenshot_prefix="", timeout=90):
-    screenshot_name = f"{screenshot_prefix}_popup.png" if screenshot_prefix else "popup_fixed.png"
-
-    print("[INFO]   [阶段1] 等待弹窗出现...")
-    for _ in range(30):
-        try:
-            body_text = sb.execute_script("return document.body.innerText || ''")
-            if "성공" in body_text and ("갱신" in body_text or "연장" in body_text):
-                print("[INFO]   检测到成功弹窗")
-                sb.save_screenshot(screenshot_name)
-                return {"status": "success", "screenshot": screenshot_name}
-            if "아직" in body_text and "Error" not in body_text:
-                print("[INFO]   检测到冷却期提示")
-                sb.save_screenshot(screenshot_name)
-                return {"status": "cooldown", "screenshot": screenshot_name}
-        except:
-            pass
-
-        if ts_exists(sb):
-            print("[INFO]   检测到 Turnstile，开始处理")
-            break
-        time.sleep(1)
-
-    if not ts_exists(sb):
-        print("[WARN]   未检测到 Turnstile，可能无需验证")
-        time.sleep(5)
-        try:
-            body_text = sb.execute_script("return document.body.innerText || ''")
-            if "성공" in body_text:
-                sb.save_screenshot(screenshot_name)
-                return {"status": "success", "screenshot": screenshot_name}
-            if "아직" in body_text:
-                sb.save_screenshot(screenshot_name)
-                return {"status": "cooldown", "screenshot": screenshot_name}
-        except:
-            pass
-        sb.save_screenshot(screenshot_name)
-        return {"status": "error", "message": "未检测到 Turnstile 且没有结果弹窗", "screenshot": screenshot_name}
-
-    if not handle_turnstile(sb, timeout=60):
-        sb.save_screenshot(screenshot_name)
-        return {"status": "error", "message": "Turnstile 验证失败", "screenshot": screenshot_name}
-
-    print("[INFO]   Turnstile 已处理，等待续期结果...")
-    result_start = time.time()
-    while time.time() - result_start < 45:
-        try:
-            body_text = sb.execute_script("return document.body.innerText || ''")
-            if "성공" in body_text and ("갱신" in body_text or "연장" in body_text):
-                print("[INFO]   续期成功!")
-                sb.save_screenshot(screenshot_name)
-                try:
-                    sb.execute_script("""
-                        var btns = document.querySelectorAll('button');
-                        btns.forEach(b => { if(b.innerText.includes('NEXT') || b.innerText.includes('Next')) b.click(); });
-                    """)
-                except:
-                    pass
-                return {"status": "success", "screenshot": screenshot_name}
-            if "아직" in body_text:
-                print("[INFO]   冷却期内")
-                sb.save_screenshot(screenshot_name)
-                try:
-                    sb.execute_script("""
-                        var btns = document.querySelectorAll('button');
-                        btns.forEach(b => { if(b.innerText.includes('NEXT') || b.innerText.includes('Next')) b.click(); });
-                    """)
-                except:
-                    pass
-                return {"status": "cooldown", "screenshot": screenshot_name}
-        except:
-            pass
-        time.sleep(2)
-
-    print("[WARN]   等待结果超时")
-    sb.save_screenshot(screenshot_name)
-    return {"status": "timeout", "screenshot": screenshot_name}
 
 
 def check_and_update_cookie(sb, cookie_env, original_cookie_value, remark=""):
@@ -837,12 +1050,11 @@ def process_single_account(sb, account, account_index):
         "cookie_updated": False,
     }
 
-    # 日志中遮盖备注
     print(f"\n{'=' * 60}")
     print(f"[INFO] 处理账号 [{account_index + 1}]: {mask_remark(remark)} ({cookie_env})")
     print(f"{'=' * 60}")
 
-    # Step 1: Turnstile
+    # Step 1: Turnstile (登录阶段)
     print(f"[INFO] [步骤1] 访问站点并处理 Cloudflare 验证...")
     sb.uc_open_with_reconnect(f"https://{DOMAIN}/", reconnect_time=5)
     if not handle_turnstile(sb):
@@ -971,7 +1183,7 @@ def process_single_account(sb, account, account_index):
 
 
 # ============================================================
-#  单账号 TG 通知（新格式，完整信息，去除了名称行）
+#  单账号 TG 通知
 # ============================================================
 
 def send_account_notification(result):
@@ -992,7 +1204,7 @@ def send_account_notification(result):
         screenshot = None
     else:
         for s in servers:
-            lines.append("")  # 空行分隔
+            lines.append("")
             lines.append(f"服务器：{s.get('server_id', '')}")
             srv_status = s["status"]
 
@@ -1000,7 +1212,6 @@ def send_account_notification(result):
                 lines.append("状态：🟢 续期成功")
                 new_exp = s.get("new_expiry", "Unknown")
                 lines.append(f"剩余：{calculate_remaining_time(new_exp)}")
-                # 延长时长
                 msg = s.get("message", "")
                 if msg and "延长" in msg:
                     lines.append(f"延长：{msg}")
@@ -1023,7 +1234,7 @@ def send_account_notification(result):
                 expiry = s.get("original_expiry", s.get("new_expiry", "Unknown"))
                 lines.append(f"剩余：{calculate_remaining_time(expiry)}")
                 lines.append(f"原因：{s.get('message', '未知')}")
-            else:  # error / timeout
+            else:
                 lines.append(f"状态：❌ {srv_status}")
                 lines.append(f"信息：{s.get('message', '未知')}")
 
@@ -1116,7 +1327,6 @@ def add_server_time():
             sync_tg_notify(f"🔔 <b>Weirdhost</b>\n\n❌ 浏览器启动失败\n\n<code>{repr(e)}</code>")
         return
 
-    # 控制台摘要
     print(f"\n{'=' * 60}")
     print("[INFO] 全部处理完成")
     print(f"{'=' * 60}")
@@ -1129,7 +1339,6 @@ def add_server_time():
         icon = icons.get(r["status"], "❓")
         srv_count = len(r.get("servers", []))
         email_display = mask_email(r.get("email", ""))
-        # 备注也遮盖
         remark_display = mask_remark(r.get("remark", "?"))
         print(f"  {icon} {remark_display} ({email_display}) | "
               f"{srv_count} 个服务器 | {r['status']} | {r.get('message', '')}")
